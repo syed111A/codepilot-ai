@@ -41,6 +41,12 @@ export async function getMe(): Promise<User | null> {
     return null;
   }
 
+  const contentType = response.headers.get('content-type') || '';
+  if (!contentType.includes('application/json')) {
+    logout();
+    throw new Error(`Authentication API returned an unexpected response (HTTP ${response.status})`);
+  }
+
   const data = await response.json();
   localStorage.setItem(USER_KEY, JSON.stringify(data.user));
   return data.user;

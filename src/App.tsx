@@ -30,6 +30,7 @@ import {
   getRepositories,
   getRepositoryTree,
   getRepositoryFile,
+  updateRepositoryFile,
   analyzeRepositoryFile,
   proposeRepositoryFileFix,
   type Repository,
@@ -1047,6 +1048,9 @@ function RepositoryWorkspace({
   const [fileContent, setFileContent] =
     useState<string>('');
 
+  const [approvedFiles, setApprovedFiles] =
+    useState<Record<string, string>>({});
+
   const [treeLoading, setTreeLoading] =
     useState(true);
 
@@ -1140,9 +1144,18 @@ function RepositoryWorkspace({
           path
         );
 
-      setFileContent(
-        result.content
+      const approvedContent = approvedFiles[path] ?? localStorage.getItem(
+        `codepilot-approved:${repository.id}:${path}`
       );
+
+      if (approvedContent && approvedFiles[path] !== approvedContent) {
+        setApprovedFiles((previous) => ({
+          ...previous,
+          [path]: approvedContent,
+        }));
+      }
+
+      setFileContent(approvedContent ?? result.content);
     } catch (err) {
       console.error(
         'Could not load file:',
@@ -1165,6 +1178,8 @@ function RepositoryWorkspace({
     try {
       setFixLoading(true);
       setFixError(null);
+      setAnalysis(null);
+      setAnalysisError(null);
       const result = await proposeRepositoryFileFix(
         repository.id,
         selectedFile,
@@ -1174,6 +1189,53 @@ function RepositoryWorkspace({
     } catch (err) {
       console.error('Could not generate file fix:', err);
       setFixError(err instanceof Error ? err.message : 'Unable to generate file fix');
+    } finally {
+      setFixLoading(false);
+    }
+  }
+
+  function rejectFix() {
+    if (fixProposal) {
+      setFileContent(fixProposal.originalCode);
+    }
+
+    setFixProposal(null);
+    setFixError(null);
+    setAnalysis(null);
+    setAnalysisError(null);
+  }
+
+  async function approveFix() {
+    if (!fixProposal) return;
+
+    if (!selectedFile) return;
+
+    try {
+      setFixLoading(true);
+      setFixError(null);
+
+      await updateRepositoryFile(
+        repository.id,
+        selectedFile,
+        fixProposal.proposedCode
+      );
+
+      const approvedContent = fixProposal.proposedCode;
+      setFileContent(approvedContent);
+      setApprovedFiles((previous) => ({
+        ...previous,
+        [selectedFile]: approvedContent,
+      }));
+      localStorage.setItem(
+        `codepilot-approved:${repository.id}:${selectedFile}`,
+        approvedContent
+      );
+
+      setFixProposal(null);
+      setAnalysis(null);
+      setAnalysisError(null);
+    } catch (err) {
+      setFixError(err instanceof Error ? err.message : 'Unable to update the file on GitHub');
     } finally {
       setFixLoading(false);
     }
@@ -1569,16 +1631,17 @@ function RepositoryWorkspace({
           </div>
         ) : (
           <div
+            className={fixProposal ? 'code-explorer-layout reviewing' : 'code-explorer-layout'}
             style={{
               display: 'grid',
-              gridTemplateColumns:
-                'minmax(250px, 35%) 1fr',
+              gridTemplateColumns: fixProposal ? '1fr' : 'minmax(250px, 35%) 1fr',
               minHeight: '500px',
             }}
           >
             {/* File tree */}
 
             <div
+              className="file-tree"
               style={{
                 borderRight:
                   '1px solid rgba(255,255,255,0.06)',
@@ -1727,6 +1790,7 @@ function RepositoryWorkspace({
             {/* File viewer */}
 
             <div
+              className="file-viewer"
               style={{
                 minWidth: 0,
                 display: 'flex',
@@ -1844,20 +1908,6 @@ function RepositoryWorkspace({
                         </div>
                       </div>
 
-                      {(analysisError || analysis) && (
-                        <div className="review-analysis">
-                          <div className="fix-review-title">
-                            <BrainCircuit size={15} />
-                            <strong>AI analysis</strong>
-                          </div>
-                          {analysisError ? (
-                            <div className="fix-error">{analysisError}</div>
-                          ) : (
-                            <p>{analysis}</p>
-                          )}
-                        </div>
-                      )}
-
                       <p className="fix-summary">{fixProposal.summary}</p>
                       <div className="diff-grid">
                         <div className="diff-panel">
@@ -1881,9 +1931,9 @@ function RepositoryWorkspace({
                       <div className="fix-review-footer">
                         <span>GitHub is not changed until you approve the fix.</span>
                         <div>
-                          <button type="button" onClick={() => { setFixProposal(null); setFixError(null); }}>Reject</button>
-                          <button type="button" className="primary" onClick={() => setFileContent(fixProposal.proposedCode)}>
-                            Approve Fix
+                          <button type="button" onClick={rejectFix}>Reject</button>
+                          <button type="button" className="primary" onClick={approveFix} disabled={fixLoading}>
+                            {fixLoading ? 'Saving to GitHub...' : 'Approve Fix'}
                           </button>
                         </div>
                       </div>

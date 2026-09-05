@@ -64,6 +64,14 @@ body {
   flex-direction: column;
 }
 
+.code-explorer-layout.reviewing .file-tree {
+  display: none;
+}
+
+.code-explorer-layout.reviewing .file-viewer {
+  width: 100%;
+}
+
 .review-analysis {
   padding: 12px;
   border: 1px solid rgba(255,255,255,0.08);
@@ -144,6 +152,11 @@ body {
   min-width: max-content;
   padding: 0 12px;
   white-space: pre;
+}
+
+.changed-new {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .changed-old {

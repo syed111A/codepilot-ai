@@ -30,6 +30,11 @@ export default function Auth({ onAuthenticated }: Props) {
         body: JSON.stringify(body)
       });
 
+      const contentType = response.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        throw new Error(`Authentication API returned an unexpected response (HTTP ${response.status})`);
+      }
+
       const data = await response.json();
       if (!response.ok) throw new Error(data.message || 'Authentication failed');
 

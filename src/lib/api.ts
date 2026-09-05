@@ -15,7 +15,23 @@ async function request<T>(
     },
   });
 
-  const data = await response.json();
+  const contentType = response.headers.get('content-type') || '';
+  const rawBody = await response.text();
+  let data: { message?: string } & T;
+
+  if (contentType.includes('application/json')) {
+    try {
+      data = JSON.parse(rawBody) as { message?: string } & T;
+    } catch {
+      throw new Error(`API returned invalid JSON (HTTP ${response.status})`);
+    }
+  } else {
+    throw new Error(
+      response.status === 404
+        ? `API route not found: ${endpoint}`
+        : `API returned an unexpected response (HTTP ${response.status})`
+    );
+  }
 
   if (!response.ok) {
     throw new Error(data.message || 'Something went wrong');
@@ -138,6 +154,21 @@ export async function getRepositoryFile(
   }>(
     `/github/repositories/${repositoryId}/file?path=${encodeURIComponent(path)}`
   );
+}
+
+export async function updateRepositoryFile(
+  repositoryId: string,
+  path: string,
+  content: string
+) {
+  return request<{
+    path: string;
+    commitSha: string | null;
+    contentSha: string | null;
+  }>(`/github/repositories/${repositoryId}/file`, {
+    method: 'PUT',
+    body: JSON.stringify({ path, content }),
+  });
 }
 
 export async function analyzeRepositoryFile(

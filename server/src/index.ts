@@ -101,6 +101,12 @@ const analyzeFileSchema = z.object({
 
 const fixFileSchema = analyzeFileSchema;
 
+const updateFileSchema = z.object({
+  repositoryId: z.string().min(1),
+  path: z.string().min(1).max(500),
+  content: z.string().max(200_000),
+});
+
 function parseFixResponse(
   response: string,
   originalCode: string
@@ -1191,6 +1197,109 @@ app.get(
         message:
           'Unable to retrieve repository file',
       });
+    }
+  }
+);
+
+app.put(
+  '/api/github/repositories/:repositoryId/file',
+  auth,
+  async (req, res) => {
+    try {
+      const parsed = updateFileSchema.safeParse({
+        ...req.body,
+        repositoryId: req.params.repositoryId,
+      });
+
+      if (!parsed.success) {
+        return res.status(400).json({
+          message: 'A valid repository, file path, and file content are required',
+        });
+      }
+
+      const userId = (req as any).userId;
+      const repository = await prisma.repository.findFirst({
+        where: {
+          id: parsed.data.repositoryId,
+          ownerId: userId,
+        },
+      });
+
+      if (!repository) {
+        return res.status(404).json({ message: 'Repository not found' });
+      }
+
+      const user = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { githubAccessToken: true },
+      });
+
+      if (!user?.githubAccessToken) {
+        return res.status(400).json({
+          message: 'GitHub is not connected. Please connect GitHub first.',
+        });
+      }
+
+      const parts = repository.fullName.split('/');
+      if (parts.length !== 2) {
+        return res.status(400).json({ message: 'Invalid GitHub repository name' });
+      }
+
+      const [owner, repo] = parts;
+      const encodedPath = parsed.data.path
+        .split('/')
+        .map((segment) => encodeURIComponent(segment))
+        .join('/');
+      const fileUrl = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encodedPath}`;
+      const headers = {
+        ...githubHeaders(user.githubAccessToken),
+        'Content-Type': 'application/json',
+      };
+
+      const currentResponse = await fetch(
+        `${fileUrl}?ref=${encodeURIComponent(repository.defaultBranch)}`,
+        { headers }
+      );
+
+      if (!currentResponse.ok) {
+        return res.status(502).json({ message: 'Unable to retrieve the current GitHub file' });
+      }
+
+      const currentFile = await currentResponse.json();
+      if (!currentFile.sha) {
+        return res.status(502).json({ message: 'GitHub did not return a file revision' });
+      }
+
+      const updateResponse = await fetch(fileUrl, {
+        method: 'PUT',
+        headers,
+        body: JSON.stringify({
+          message: `Apply AI fix to ${parsed.data.path}`,
+          content: Buffer.from(parsed.data.content, 'utf-8').toString('base64'),
+          sha: String(currentFile.sha),
+          branch: repository.defaultBranch,
+        }),
+      });
+
+      if (!updateResponse.ok) {
+        const errorText = await updateResponse.text();
+        console.error('GitHub file update error:', updateResponse.status, errorText);
+        return res.status(updateResponse.status === 409 ? 409 : 502).json({
+          message: updateResponse.status === 409
+            ? 'The GitHub file changed since it was opened. Reload it and try again.'
+            : 'Unable to update the file on GitHub',
+        });
+      }
+
+      const updateData = await updateResponse.json();
+      return res.json({
+        path: parsed.data.path,
+        commitSha: updateData.commit?.sha || null,
+        contentSha: updateData.content?.sha || null,
+      });
+    } catch (error) {
+      console.error('Repository file update error:', error);
+      return res.status(500).json({ message: 'Unable to update repository file' });
     }
   }
 );
