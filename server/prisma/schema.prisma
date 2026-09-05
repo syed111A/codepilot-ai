@@ -1,0 +1,37 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id                String       @id @default(cuid())
+  name              String
+  email             String       @unique
+  passwordHash      String
+  avatarUrl         String?
+  githubAccessToken String?
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+  repositories      Repository[]
+}
+
+model Repository {
+  id            String   @id @default(cuid())
+  name          String
+  fullName      String
+  githubId      String
+  defaultBranch String   @default("main")
+  language      String?
+  ownerId       String
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  owner User @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  @@index([ownerId])
+  @@unique([githubId, ownerId])
+}
