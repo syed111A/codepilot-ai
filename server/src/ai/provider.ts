@@ -11,6 +11,25 @@ type ProviderResult = {
   text: string;
 };
 
+export type RepositoryReviewFinding = {
+  severity: 'Critical' | 'High' | 'Medium' | 'Low' | 'Info';
+  title: string;
+  file: string;
+  line: string;
+  explanation: string;
+  confidence: number;
+  suggestedFix: string;
+};
+
+export type GeneratedTestCase = {
+  sourceFile: string;
+  testFile: string;
+  framework: string;
+  title: string;
+  rationale: string;
+  testCode: string;
+};
+
 const systemPrompt = [
   'You are CodePilot, a senior code reviewer.',
   'Analyze source code for bugs, security vulnerabilities, performance problems, code-quality issues, and improvements.',
@@ -62,6 +81,56 @@ export async function generateCodeFix(input: ProviderInput): Promise<ProviderRes
     ].join(' '),
     formatUserPrompt(input),
     true
+  );
+}
+
+export async function runRepositoryReview(
+  input: ProviderInput
+): Promise<ProviderResult> {
+  return runProviderRequest(
+    input,
+    [
+      systemPrompt,
+      'Review the complete repository context, considering relationships between files, configuration, dependencies, data flow, and architecture.',
+      'Return valid JSON only with exactly these fields: summary (string) and findings (array).',
+      'Each finding must contain exactly these fields: severity (Critical, High, Medium, Low, or Info), title (string), file (string), line (string), explanation (string), confidence (number from 0 to 1), and suggestedFix (string).',
+      'Only report evidence-based findings. Use an empty findings array when no actionable issue is identified.',
+    ].join(' '),
+    input.content,
+    true
+  );
+}
+
+export async function generateRepositoryTests(
+  input: { repository: string; content: string }
+): Promise<ProviderResult> {
+  return runProviderRequest(
+    { repository: input.repository, path: 'repository', content: input.content },
+    [
+      'You identify missing or insufficient unit tests from real repository source files.',
+      'Return valid JSON only with exactly these fields: summary (string) and tests (array).',
+      'Each test must contain sourceFile, testFile, framework, title, rationale, and testCode as strings.',
+      'Generate practical tests only for behavior supported by the supplied source. Prefer the repository language and existing test conventions.',
+      'Use an empty tests array when no meaningful test can be generated.',
+    ].join(' '),
+    input.content,
+    true
+  );
+}
+
+export async function answerRepositoryQuestion(
+  input: { repository: string; question: string; content: string }
+): Promise<ProviderResult> {
+  return runProviderRequest(
+    { repository: input.repository, path: 'repository', content: input.content },
+    [
+      'You are CodePilot, an AI engineering assistant answering questions about a repository.',
+      'Use only the repository context supplied by the user. Never invent files, symbols, dependencies, or behavior.',
+      'If the context is insufficient, say exactly what is missing and do not guess.',
+      'Answer clearly and practically. Reference relevant file paths and symbols from the context when available.',
+    ].join(' '),
+    `Repository question: ${input.question}\n\nRepository context:\n${input.content}`,
+    false
   );
 }
 

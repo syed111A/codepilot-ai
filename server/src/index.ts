@@ -9,7 +9,11 @@ import { PrismaClient } from './generated/prisma/client';
 import { PrismaPg } from '@prisma/adapter-pg';
 import {
   generateCodeFix,
+  generateRepositoryTests,
+  answerRepositoryQuestion,
   runCodeReview,
+  runRepositoryReview,
+  type RepositoryReviewFinding,
 } from './ai/provider';
 
 loadEnv({
@@ -101,10 +105,64 @@ const analyzeFileSchema = z.object({
 
 const fixFileSchema = analyzeFileSchema;
 
+const analyzeRepositorySchema = z.object({
+  repositoryId: z.string().min(1),
+});
+
+const assistantQuestionSchema = z.object({
+  repositoryId: z.string().min(1),
+  question: z.string().min(1).max(4_000),
+});
+
+function parseGeneratedTests(response: string) {
+  const cleaned = response
+    .trim()
+    .replace(/^```(?:json)?\s*/, '')
+    .replace(/\s*```$/, '')
+    .trim();
+
+  try {
+    const parsed = JSON.parse(cleaned) as { summary?: unknown; tests?: unknown };
+    const tests = Array.isArray(parsed.tests)
+      ? parsed.tests.flatMap((test) => {
+        if (!test || typeof test !== 'object') return [];
+        const item = test as Record<string, unknown>;
+        if (Object.values(item).some((value) => typeof value !== 'string')) return [];
+        if (!item.sourceFile || !item.testFile || !item.framework || !item.title || !item.rationale || !item.testCode) return [];
+        return [{
+          sourceFile: item.sourceFile,
+          testFile: item.testFile,
+          framework: item.framework,
+          title: item.title,
+          rationale: item.rationale,
+          testCode: item.testCode,
+        }];
+      })
+      : [];
+
+    return {
+      summary: typeof parsed.summary === 'string' ? parsed.summary : 'Test generation complete.',
+      tests,
+    };
+  } catch {
+    return { summary: 'The AI provider returned an unreadable test plan.', tests: [] };
+  }
+}
+
 const updateFileSchema = z.object({
   repositoryId: z.string().min(1),
   path: z.string().min(1).max(500),
   content: z.string().max(200_000),
+});
+
+const createPullRequestSchema = z.object({
+  repositoryId: z.string().min(1),
+  title: z.string().min(1).max(200),
+  body: z.string().min(1).max(50_000),
+  changes: z.array(z.object({
+    path: z.string().min(1).max(500),
+    content: z.string().max(200_000),
+  })).min(1),
 });
 
 function parseFixResponse(
@@ -228,6 +286,215 @@ function githubHeaders(token: string) {
     Authorization: `Bearer ${token}`,
     'X-GitHub-Api-Version': '2022-11-28',
   };
+}
+
+const ignoredPathParts = new Set([
+  '.git',
+  '.next',
+  '.nuxt',
+  '.venv',
+  'build',
+  'coverage',
+  'dist',
+  'node_modules',
+  'out',
+  'target',
+  'vendor',
+]);
+
+const ignoredExtensions = new Set([
+  '.7z',
+  '.avi',
+  '.bmp',
+  '.class',
+  '.dll',
+  '.dmg',
+  '.exe',
+  '.gif',
+  '.gz',
+  '.ico',
+  '.iso',
+  '.jar',
+  '.jpeg',
+  '.jpg',
+  '.lock',
+  '.mp3',
+  '.mp4',
+  '.mov',
+  '.o',
+  '.obj',
+  '.pdf',
+  '.png',
+  '.so',
+  '.svg',
+  '.tar',
+  '.ttf',
+  '.wav',
+  '.webm',
+  '.woff',
+  '.woff2',
+  '.zip',
+]);
+
+type IndexedRepositoryFile = {
+  path: string;
+  content: string;
+  tokens: Set<string>;
+  symbols: string[];
+};
+
+type RepositoryIndex = {
+  branch: string;
+  createdAt: number;
+  files: IndexedRepositoryFile[];
+};
+
+const repositoryIndexes = new Map<string, RepositoryIndex>();
+
+function tokenize(value: string) {
+  return value.toLowerCase().match(/[a-z0-9_$-]{2,}/g) || [];
+}
+
+function extractSymbols(content: string) {
+  return [...content.matchAll(/(?:function|class|interface|type|const|def|func)\s+([A-Za-z_$][\w$]*)/g)]
+    .map((match) => match[1]);
+}
+
+function scoreIndexedFile(file: IndexedRepositoryFile, query: string) {
+  const queryTokens = tokenize(query);
+  return queryTokens.reduce((score, token) => {
+    const path = file.path.toLowerCase();
+    const symbolMatch = file.symbols.some((symbol) => symbol.toLowerCase().includes(token));
+    return score + (path.includes(token) ? 5 : 0) + (symbolMatch ? 4 : 0) + (file.tokens.has(token) ? 1 : 0);
+  }, 0);
+}
+
+async function buildRepositoryIndex(
+  repository: { id: string; fullName: string; defaultBranch: string },
+  token: string,
+  force = false
+) {
+  const cached = repositoryIndexes.get(repository.id);
+  if (!force && cached?.branch === repository.defaultBranch) return cached;
+
+  const parts = repository.fullName.split('/');
+  if (parts.length !== 2) throw new Error('Invalid GitHub repository name');
+  const [owner, repo] = parts;
+  const headers = githubHeaders(token);
+  const treeResponse = await fetch(
+    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees/${encodeURIComponent(repository.defaultBranch)}?recursive=1`,
+    { headers }
+  );
+  if (!treeResponse.ok) throw new Error('Unable to retrieve repository files from GitHub');
+
+  const treeData = await treeResponse.json() as { tree?: Array<{ type?: string; path?: string; sha?: string; size?: number }> };
+  const candidates = (treeData.tree || [])
+    .filter((item) => item.type === 'blob' && typeof item.path === 'string' && item.sha)
+    .filter((item) => isAnalyzablePath(item.path!, item.size))
+    .slice(0, 100);
+  const files: IndexedRepositoryFile[] = [];
+
+  for (const candidate of candidates) {
+    const blobResponse = await fetch(
+      `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/blobs/${encodeURIComponent(candidate.sha!)}`,
+      { headers }
+    );
+    if (!blobResponse.ok) continue;
+    const blobData = await blobResponse.json() as { encoding?: string; content?: string };
+    if (blobData.encoding !== 'base64' || typeof blobData.content !== 'string') continue;
+    const content = Buffer.from(blobData.content.replace(/\s/g, ''), 'base64').toString('utf-8');
+    if (content.includes('\u0000')) continue;
+    files.push({
+      path: candidate.path!,
+      content,
+      tokens: new Set(tokenize(`${candidate.path} ${content}`)),
+      symbols: extractSymbols(content),
+    });
+  }
+
+  const index = { branch: repository.defaultBranch, createdAt: Date.now(), files };
+  repositoryIndexes.set(repository.id, index);
+  return index;
+}
+
+function retrieveRepositoryContext(index: RepositoryIndex, question: string) {
+  return index.files
+    .map((file) => ({ file, score: scoreIndexedFile(file, question) }))
+    .sort((left, right) => right.score - left.score || left.file.path.localeCompare(right.file.path))
+    .slice(0, 8)
+    .filter((item) => item.score > 0 || question.trim().length === 0)
+    .map((item) => item.file);
+}
+
+function isAnalyzablePath(path: string, size: unknown) {
+  const parts = path.toLowerCase().split('/');
+  const extension = parts[parts.length - 1].includes('.')
+    ? `.${parts[parts.length - 1].split('.').pop()}`
+    : '';
+
+  return !parts.some((part) => ignoredPathParts.has(part)) &&
+    !ignoredExtensions.has(extension) &&
+    (typeof size !== 'number' || size <= 80_000);
+}
+
+function parseRepositoryReview(
+  response: string
+): { summary: string; findings: RepositoryReviewFinding[] } {
+  const cleaned = response
+    .trim()
+    .replace(/^```(?:json)?\s*/, '')
+    .replace(/\s*```$/, '')
+    .trim();
+
+  try {
+    const parsed = JSON.parse(cleaned) as {
+      summary?: unknown;
+      findings?: unknown;
+    };
+    const findings = Array.isArray(parsed.findings)
+      ? parsed.findings.flatMap((finding) => {
+        if (!finding || typeof finding !== 'object') return [];
+
+        const item = finding as Record<string, unknown>;
+        const severity = item.severity;
+        if (
+          typeof item.title !== 'string' ||
+          typeof item.file !== 'string' ||
+          typeof item.line !== 'string' ||
+          typeof item.explanation !== 'string' ||
+          typeof item.confidence !== 'number' ||
+          item.confidence < 0 ||
+          item.confidence > 1 ||
+          typeof item.suggestedFix !== 'string' ||
+          !['Critical', 'High', 'Medium', 'Low', 'Info'].includes(String(severity))
+        ) {
+          return [];
+        }
+
+        return [{
+          severity: severity as RepositoryReviewFinding['severity'],
+          title: item.title,
+          file: item.file,
+          line: item.line,
+          explanation: item.explanation,
+          confidence: item.confidence,
+          suggestedFix: item.suggestedFix,
+        }];
+      })
+      : [];
+
+    return {
+      summary: typeof parsed.summary === 'string'
+        ? parsed.summary
+        : 'Repository review complete.',
+      findings,
+    };
+  } catch {
+    return {
+      summary: 'The AI provider returned an unreadable repository review.',
+      findings: [],
+    };
+  }
 }
 
 // --------------------------------------------------
@@ -1303,6 +1570,379 @@ app.put(
     }
   }
 );
+
+app.post(
+  '/api/github/repositories/:repositoryId/pull-request',
+  auth,
+  async (req, res) => {
+    try {
+      const parsed = createPullRequestSchema.safeParse({
+        ...req.body,
+        repositoryId: req.params.repositoryId,
+      });
+      if (!parsed.success) {
+        return res.status(400).json({ message: 'A valid pull request title, body, and approved changes are required' });
+      }
+
+      const userId = (req as any).userId;
+      const repository = await prisma.repository.findFirst({
+        where: { id: parsed.data.repositoryId, ownerId: userId },
+      });
+      if (!repository) return res.status(404).json({ message: 'Repository not found' });
+
+      const user = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { githubAccessToken: true },
+      });
+      if (!user?.githubAccessToken) {
+        return res.status(400).json({ message: 'GitHub is not connected. Please connect GitHub first.' });
+      }
+
+      const parts = repository.fullName.split('/');
+      if (parts.length !== 2) return res.status(400).json({ message: 'Invalid GitHub repository name' });
+      const [owner, repo] = parts;
+      const headers = { ...githubHeaders(user.githubAccessToken), 'Content-Type': 'application/json' };
+      const apiBase = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+
+      const branch = `codepilot/approved-fixes-${Date.now()}`;
+      const refResponse = await fetch(`${apiBase}/git/ref/heads/${encodeURIComponent(repository.defaultBranch)}`, { headers });
+      if (!refResponse.ok) return res.status(502).json({ message: 'Unable to read the default GitHub branch' });
+      const refData = await refResponse.json() as { object?: { sha?: string } };
+      if (!refData.object?.sha) return res.status(502).json({ message: 'GitHub did not return the default branch revision' });
+
+      const branchResponse = await fetch(`${apiBase}/git/refs`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: refData.object.sha }),
+      });
+      if (!branchResponse.ok) {
+        const details = await branchResponse.text();
+        console.error('GitHub branch creation error:', branchResponse.status, details);
+        return res.status(502).json({ message: 'Unable to create a GitHub branch for the pull request' });
+      }
+
+      for (const change of parsed.data.changes) {
+        const encodedPath = change.path.split('/').map((segment) => encodeURIComponent(segment)).join('/');
+        const fileUrl = `${apiBase}/contents/${encodedPath}`;
+        const currentResponse = await fetch(`${fileUrl}?ref=${encodeURIComponent(repository.defaultBranch)}`, { headers });
+        if (!currentResponse.ok) {
+          return res.status(502).json({ message: `Unable to read ${change.path} from the default branch` });
+        }
+        const currentFile = await currentResponse.json() as { sha?: string };
+        if (!currentFile.sha) return res.status(502).json({ message: `GitHub did not return a revision for ${change.path}` });
+
+        const updateResponse = await fetch(fileUrl, {
+          method: 'PUT',
+          headers,
+          body: JSON.stringify({
+            message: `Apply approved CodePilot change to ${change.path}`,
+            content: Buffer.from(change.content, 'utf-8').toString('base64'),
+            sha: currentFile.sha,
+            branch,
+          }),
+        });
+        if (!updateResponse.ok) {
+          const details = await updateResponse.text();
+          console.error('GitHub branch file update error:', updateResponse.status, details);
+          return res.status(502).json({ message: `Unable to apply ${change.path} to the pull request branch` });
+        }
+      }
+
+      const pullResponse = await fetch(`${apiBase}/pulls`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          title: parsed.data.title,
+          body: parsed.data.body,
+          head: branch,
+          base: repository.defaultBranch,
+        }),
+      });
+      if (!pullResponse.ok) {
+        const details = await pullResponse.text();
+        console.error('GitHub pull request error:', pullResponse.status, details);
+        return res.status(502).json({ message: 'Branch created, but GitHub could not create the pull request' });
+      }
+
+      const pull = await pullResponse.json() as { html_url?: string; number?: number; title?: string };
+      return res.status(201).json({
+        number: pull.number || null,
+        title: pull.title || parsed.data.title,
+        url: pull.html_url || null,
+        branch,
+        base: repository.defaultBranch,
+      });
+    } catch (error) {
+      console.error('GitHub pull request creation error:', error);
+      return res.status(500).json({ message: error instanceof Error ? error.message : 'Unable to create pull request' });
+    }
+  }
+);
+
+// --------------------------------------------------
+// AI Repository Analysis
+// --------------------------------------------------
+
+app.post(
+  '/api/ai/analyze-repository',
+  auth,
+  async (req, res) => {
+    try {
+      const parsed = analyzeRepositorySchema.safeParse(req.body);
+
+      if (!parsed.success) {
+        return res.status(400).json({
+          message: 'A valid repository is required',
+        });
+      }
+
+      const userId = (req as any).userId;
+      const repository = await prisma.repository.findFirst({
+        where: {
+          id: parsed.data.repositoryId,
+          ownerId: userId,
+        },
+      });
+
+      if (!repository) {
+        return res.status(404).json({ message: 'Repository not found' });
+      }
+
+      const user = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { githubAccessToken: true },
+      });
+
+      if (!user?.githubAccessToken) {
+        return res.status(400).json({
+          message: 'GitHub is not connected. Please connect GitHub first.',
+        });
+      }
+
+      const parts = repository.fullName.split('/');
+      if (parts.length !== 2) {
+        return res.status(400).json({ message: 'Invalid GitHub repository name' });
+      }
+
+      const [owner, repo] = parts;
+      const headers = githubHeaders(user.githubAccessToken);
+      const treeUrl =
+        `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees/${encodeURIComponent(repository.defaultBranch)}?recursive=1`;
+      const treeResponse = await fetch(treeUrl, { headers });
+
+      if (!treeResponse.ok) {
+        return res.status(treeResponse.status === 401 ? 401 : 502).json({
+          message: treeResponse.status === 401
+            ? 'GitHub authorization expired. Please reconnect GitHub.'
+            : 'Unable to retrieve the repository tree from GitHub',
+        });
+      }
+
+      const treeData = await treeResponse.json() as {
+        tree?: Array<{ type?: string; path?: string; sha?: string; size?: number }>;
+      };
+      const candidates = (treeData.tree || [])
+        .filter((item) => item.type === 'blob' && typeof item.path === 'string' && item.sha)
+        .filter((item) => isAnalyzablePath(item.path!, item.size))
+        .sort((left, right) => {
+          const priority = (path: string) => /(^|\/)(package\.json|README|tsconfig|vite\.config|\.env\.example)/i.test(path) ? 0 : 1;
+          return priority(left.path!) - priority(right.path!) || left.path!.localeCompare(right.path!);
+        })
+        .slice(0, 40);
+
+      const files: string[] = [];
+      let contextBytes = 0;
+      const maxContextBytes = 120_000;
+
+      for (const candidate of candidates) {
+        const blobUrl =
+          `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/blobs/${encodeURIComponent(candidate.sha!)}`;
+        const blobResponse = await fetch(blobUrl, { headers });
+        if (!blobResponse.ok) continue;
+
+        const blobData = await blobResponse.json() as {
+          encoding?: string;
+          content?: string;
+        };
+        if (blobData.encoding !== 'base64' || typeof blobData.content !== 'string') continue;
+
+        const content = Buffer.from(blobData.content.replace(/\s/g, ''), 'base64').toString('utf-8');
+        if (content.includes('\u0000')) continue;
+
+        const section = `### FILE: ${candidate.path}\n${content}\n\n`;
+        const sectionBytes = Buffer.byteLength(section, 'utf-8');
+        if (contextBytes + sectionBytes > maxContextBytes) continue;
+
+        files.push(section);
+        contextBytes += sectionBytes;
+      }
+
+      if (files.length === 0) {
+        return res.status(422).json({
+          message: 'No supported source files were found to analyze',
+        });
+      }
+
+      const result = await runRepositoryReview({
+        repository: repository.fullName,
+        path: 'repository',
+        content: files.join(''),
+      });
+      const review = parseRepositoryReview(result.text);
+
+      return res.json({
+        repository: repository.fullName,
+        model: result.model,
+        filesAnalyzed: files.length,
+        summary: review.summary,
+        findings: review.findings,
+      });
+    } catch (error) {
+      console.error('Repository analysis error:', error);
+      return res.status(500).json({
+        message: error instanceof Error
+          ? error.message
+          : 'Unable to analyze repository',
+      });
+    }
+  }
+);
+
+app.post(
+  '/api/ai/generate-tests',
+  auth,
+  async (req, res) => {
+    try {
+      const parsed = analyzeRepositorySchema.safeParse(req.body);
+      if (!parsed.success) return res.status(400).json({ message: 'A valid repository is required' });
+
+      const repository = await prisma.repository.findFirst({
+        where: { id: parsed.data.repositoryId, ownerId: (req as any).userId },
+      });
+      if (!repository) return res.status(404).json({ message: 'Repository not found' });
+
+      const user = await prisma.user.findUnique({
+        where: { id: (req as any).userId },
+        select: { githubAccessToken: true },
+      });
+      if (!user?.githubAccessToken) return res.status(400).json({ message: 'GitHub is not connected. Please connect GitHub first.' });
+
+      const parts = repository.fullName.split('/');
+      if (parts.length !== 2) return res.status(400).json({ message: 'Invalid GitHub repository name' });
+      const [owner, repo] = parts;
+      const headers = githubHeaders(user.githubAccessToken);
+      const treeResponse = await fetch(
+        `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees/${encodeURIComponent(repository.defaultBranch)}?recursive=1`,
+        { headers }
+      );
+      if (!treeResponse.ok) return res.status(502).json({ message: 'Unable to retrieve the repository source files from GitHub' });
+
+      const treeData = await treeResponse.json() as { tree?: Array<{ type?: string; path?: string; sha?: string; size?: number }> };
+      const candidates = (treeData.tree || [])
+        .filter((item) => item.type === 'blob' && typeof item.path === 'string' && item.sha)
+        .filter((item) => isAnalyzablePath(item.path!, item.size))
+        .filter((item) => !/(^|\/)(test|tests|__tests__)(\/|$)|\.(test|spec)\.[^.]+$/i.test(item.path!))
+        .slice(0, 25);
+      const files: string[] = [];
+      let contextBytes = 0;
+
+      for (const candidate of candidates) {
+        const blobResponse = await fetch(
+          `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/blobs/${encodeURIComponent(candidate.sha!)}`,
+          { headers }
+        );
+        if (!blobResponse.ok) continue;
+        const blobData = await blobResponse.json() as { encoding?: string; content?: string };
+        if (blobData.encoding !== 'base64' || typeof blobData.content !== 'string') continue;
+        const content = Buffer.from(blobData.content.replace(/\s/g, ''), 'base64').toString('utf-8');
+        const section = `### FILE: ${candidate.path}\n${content}\n\n`;
+        const bytes = Buffer.byteLength(section, 'utf-8');
+        if (contextBytes + bytes > 100_000) continue;
+        files.push(section);
+        contextBytes += bytes;
+      }
+
+      if (files.length === 0) return res.status(422).json({ message: 'No supported source files were found to test' });
+      const result = await generateRepositoryTests({ repository: repository.fullName, content: files.join('') });
+      const generated = parseGeneratedTests(result.text);
+      return res.json({ repository: repository.fullName, model: result.model, filesAnalyzed: files.length, ...generated });
+    } catch (error) {
+      console.error('Test generation error:', error);
+      return res.status(500).json({ message: error instanceof Error ? error.message : 'Unable to generate repository tests' });
+    }
+  }
+);
+
+app.post(
+  '/api/ai/assistant',
+  auth,
+  async (req, res) => {
+    try {
+      const parsed = assistantQuestionSchema.safeParse(req.body);
+      if (!parsed.success) return res.status(400).json({ message: 'A repository and question are required' });
+
+      const userId = (req as any).userId;
+      const repository = await prisma.repository.findFirst({
+        where: { id: parsed.data.repositoryId, ownerId: userId },
+      });
+      if (!repository) return res.status(404).json({ message: 'Repository not found' });
+
+      const user = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { githubAccessToken: true },
+      });
+      if (!user?.githubAccessToken) return res.status(400).json({ message: 'GitHub is not connected. Please connect GitHub first.' });
+
+      const index = await buildRepositoryIndex(repository, user.githubAccessToken);
+      const retrieved = retrieveRepositoryContext(index, parsed.data.question);
+      if (retrieved.length === 0) return res.status(422).json({ message: 'No relevant repository files were found for that question' });
+      const context = retrieved.map((file) => `### FILE: ${file.path}\n${file.content}\n\n`).join('');
+      const result = await answerRepositoryQuestion({
+        repository: repository.fullName,
+        question: parsed.data.question,
+        content: context,
+      });
+
+      return res.json({ repository: repository.fullName, model: result.model, answer: result.text, sources: retrieved.map((file) => file.path) });
+    } catch (error) {
+      console.error('Repository assistant error:', error);
+      return res.status(500).json({ message: error instanceof Error ? error.message : 'Unable to answer repository question' });
+    }
+  }
+);
+
+app.post('/api/github/repositories/:repositoryId/index', auth, async (req, res) => {
+  try {
+    const repository = await prisma.repository.findFirst({ where: { id: String(req.params.repositoryId), ownerId: (req as any).userId } });
+    if (!repository) return res.status(404).json({ message: 'Repository not found' });
+    const user = await prisma.user.findUnique({ where: { id: (req as any).userId }, select: { githubAccessToken: true } });
+    if (!user?.githubAccessToken) return res.status(400).json({ message: 'GitHub is not connected. Please connect GitHub first.' });
+    const index = await buildRepositoryIndex(repository, user.githubAccessToken, true);
+    return res.json({ repository: repository.fullName, filesIndexed: index.files.length, indexedAt: index.createdAt });
+  } catch (error) {
+    return res.status(502).json({ message: error instanceof Error ? error.message : 'Unable to index repository' });
+  }
+});
+
+app.get('/api/github/repositories/:repositoryId/search', auth, async (req, res) => {
+  try {
+    const repository = await prisma.repository.findFirst({ where: { id: String(req.params.repositoryId), ownerId: (req as any).userId } });
+    if (!repository) return res.status(404).json({ message: 'Repository not found' });
+    const user = await prisma.user.findUnique({ where: { id: (req as any).userId }, select: { githubAccessToken: true } });
+    if (!user?.githubAccessToken) return res.status(400).json({ message: 'GitHub is not connected. Please connect GitHub first.' });
+    const query = String(req.query.q || '').trim();
+    if (!query) return res.status(400).json({ message: 'A search query is required' });
+    const index = await buildRepositoryIndex(repository, user.githubAccessToken);
+    const results = index.files
+      .map((file) => ({ path: file.path, symbols: file.symbols, score: scoreIndexedFile(file, query) }))
+      .filter((result) => result.score > 0)
+      .sort((left, right) => right.score - left.score)
+      .slice(0, 20);
+    return res.json({ query, results, filesIndexed: index.files.length });
+  } catch (error) {
+    return res.status(502).json({ message: error instanceof Error ? error.message : 'Unable to search repository' });
+  }
+});
 
 // --------------------------------------------------
 // AI Code Analysis

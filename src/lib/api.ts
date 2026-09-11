@@ -171,6 +171,24 @@ export async function updateRepositoryFile(
   });
 }
 
+export async function createRepositoryPullRequest(
+  repositoryId: string,
+  title: string,
+  body: string,
+  changes: Array<{ path: string; content: string }>
+) {
+  return request<{
+    number: number | null;
+    title: string;
+    url: string | null;
+    branch: string;
+    base: string;
+  }>(`/github/repositories/${repositoryId}/pull-request`, {
+    method: 'POST',
+    body: JSON.stringify({ title, body, changes }),
+  });
+}
+
 export async function analyzeRepositoryFile(
   repositoryId: string,
   path: string,
@@ -188,6 +206,78 @@ export async function analyzeRepositoryFile(
       content,
     }),
   });
+}
+
+export type RepositoryAnalysisFinding = {
+  severity: 'Critical' | 'High' | 'Medium' | 'Low' | 'Info';
+  title: string;
+  file: string;
+  line: string;
+  explanation: string;
+  confidence: number;
+  suggestedFix: string;
+};
+
+export async function analyzeRepository(repositoryId: string) {
+  return request<{
+    repository: string;
+    model: string;
+    filesAnalyzed: number;
+    summary: string;
+    findings: RepositoryAnalysisFinding[];
+  }>('/ai/analyze-repository', {
+    method: 'POST',
+    body: JSON.stringify({ repositoryId }),
+  });
+}
+
+export type GeneratedTestCase = {
+  sourceFile: string;
+  testFile: string;
+  framework: string;
+  title: string;
+  rationale: string;
+  testCode: string;
+};
+
+export async function generateRepositoryTests(repositoryId: string) {
+  return request<{
+    repository: string;
+    model: string;
+    filesAnalyzed: number;
+    summary: string;
+    tests: GeneratedTestCase[];
+  }>('/ai/generate-tests', {
+    method: 'POST',
+    body: JSON.stringify({ repositoryId }),
+  });
+}
+
+export async function askRepositoryAssistant(repositoryId: string, question: string) {
+  return request<{
+    repository: string;
+    model: string;
+    answer: string;
+    sources: string[];
+  }>('/ai/assistant', {
+    method: 'POST',
+    body: JSON.stringify({ repositoryId, question }),
+  });
+}
+
+export async function indexRepository(repositoryId: string) {
+  return request<{ repository: string; filesIndexed: number; indexedAt: number }>(
+    `/github/repositories/${repositoryId}/index`,
+    { method: 'POST' }
+  );
+}
+
+export async function searchRepository(repositoryId: string, query: string) {
+  return request<{
+    query: string;
+    filesIndexed: number;
+    results: Array<{ path: string; symbols: string[]; score: number }>;
+  }>(`/github/repositories/${repositoryId}/search?q=${encodeURIComponent(query)}`);
 }
 
 export async function proposeRepositoryFileFix(

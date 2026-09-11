@@ -30,10 +30,17 @@ import {
   getRepositories,
   getRepositoryTree,
   getRepositoryFile,
-  updateRepositoryFile,
+  createRepositoryPullRequest,
+  analyzeRepository,
+  generateRepositoryTests,
+  askRepositoryAssistant,
+  indexRepository,
+  searchRepository,
   analyzeRepositoryFile,
   proposeRepositoryFileFix,
   type Repository,
+  type RepositoryAnalysisFinding,
+  type GeneratedTestCase,
   type RepositoryTreeItem,
 } from './lib/api';
 
@@ -341,14 +348,16 @@ export default function App() {
                 key={label}
                 className={
                   active === label &&
-                  !selectedRepository
+                  (label === 'Code Analysis' || label === 'Security' || label === 'Tests' || label === 'Pull Requests' || label === 'AI Assistant' || !selectedRepository)
                     ? 'nav-item active'
                     : 'nav-item'
                 }
                 onClick={() => {
-                  setSelectedRepository(
-                    null
-                  );
+                  if (label === 'AI Assistant' && !selectedRepository && repositories[0]) {
+                    setSelectedRepository(repositories[0]);
+                  } else if (label !== 'Code Analysis' && label !== 'Security' && label !== 'Tests' && label !== 'Pull Requests' && label !== 'AI Assistant') {
+                    setSelectedRepository(null);
+                  }
 
                   setActive(label);
                   setMobile(false);
@@ -358,10 +367,6 @@ export default function App() {
 
                 <span>{label}</span>
 
-                {label ===
-                  'Security' && (
-                  <em>4</em>
-                )}
               </button>
             )
           )}
@@ -482,6 +487,12 @@ export default function App() {
             repository={
               selectedRepository
             }
+            showAnalysis={active === 'Code Analysis'}
+            showSecurity={active === 'Security'}
+            showTests={active === 'Tests'}
+            showPullRequests={active === 'Pull Requests'}
+            showAssistant={active === 'AI Assistant'}
+            onOpenCodeExplorer={() => setActive('Repository Workspace')}
             onBack={
               backToDashboard
             }
@@ -909,7 +920,7 @@ function Dashboard({
         <section className="panel ai">
           <PanelTitle
             title="AI assistant"
-            action="Open assistant"
+            action={repositories.length ? 'Open assistant' : undefined}
           />
 
           <div className="ai-body">
@@ -1034,11 +1045,476 @@ function Dashboard({
   );
 }
 
+function CodeAnalysisView({
+  repository,
+  analysis,
+  loading,
+  error,
+  securityOnly = false,
+  onAnalyze,
+  onOpenFile,
+  onProposeFix,
+}: {
+  repository: Repository;
+  analysis: {
+    model: string;
+    filesAnalyzed: number;
+    summary: string;
+    findings: RepositoryAnalysisFinding[];
+  } | null;
+  loading: boolean;
+  error: string | null;
+  securityOnly?: boolean;
+  onAnalyze: () => void;
+  onOpenFile: (path: string) => void;
+  onProposeFix: (finding: RepositoryAnalysisFinding) => void;
+}) {
+  const [severityFilter, setSeverityFilter] = useState('All');
+  const severities = ['All', 'Critical', 'High', 'Medium', 'Low', 'Info'];
+  const findings = analysis?.findings
+    .filter((finding) => !securityOnly || isSecurityFinding(finding))
+    .filter((finding) => severityFilter === 'All' || finding.severity === severityFilter) || [];
+
+  return (
+    <section className="content">
+      <div className="hero">
+        <div>
+          <div className="eyebrow">
+            <span className="pulse"></span>
+            {securityOnly ? 'SECURITY' : 'CODE ANALYSIS'}
+          </div>
+          <h1>{repository.name} {securityOnly ? 'security issues' : 'findings'}</h1>
+          <p>{securityOnly ? 'Review security-related findings from Analyze repository.' : 'Review the latest findings from Analyze repository.'}</p>
+        </div>
+
+        <button className="primary" onClick={onAnalyze} disabled={loading}>
+          {loading ? <Loader2 size={17} className="spin" /> : <Sparkles size={17} />}
+          {loading ? 'Analyzing repository...' : 'Analyze repository'}
+        </button>
+      </div>
+
+      {error && (
+        <section className="panel" style={{ marginTop: '24px' }}>
+          <div style={{ padding: '20px', color: '#ef7777', fontSize: '13px' }}>{error}</div>
+        </section>
+      )}
+
+      {!analysis && !loading && !error && (
+        <section className="panel" style={{ marginTop: '24px' }}>
+          <div style={{ padding: '32px', textAlign: 'center', color: '#8f9aaa' }}>
+            Run Analyze repository to load findings for {repository.fullName}.
+          </div>
+        </section>
+      )}
+
+      {analysis && (
+        <section className="panel" style={{ marginTop: '24px' }}>
+          <PanelTitle
+            title={securityOnly ? 'Security findings' : 'Repository findings'}
+            action={`${analysis.filesAnalyzed} files · ${analysis.model}`}
+          />
+          <div style={{ padding: '20px' }}>
+            <p style={{ margin: '0 0 18px', color: '#b7bfce', lineHeight: 1.6 }}>
+              {analysis.summary}
+            </p>
+
+            <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '16px' }}>
+              {severities.map((severity) => (
+                <button
+                  type="button"
+                  key={severity}
+                  onClick={() => setSeverityFilter(severity)}
+                  style={{
+                    border: severityFilter === severity ? '1px solid #8b7cff' : '1px solid #293141',
+                    background: severityFilter === severity ? 'rgba(139,124,255,0.16)' : '#11161e',
+                    color: severityFilter === severity ? '#c8c1ff' : '#8f9aaa',
+                    borderRadius: '6px',
+                    padding: '7px 10px',
+                    fontSize: '11px',
+                    cursor: 'pointer',
+                  }}
+                >
+                  {severity}
+                </button>
+              ))}
+            </div>
+
+            {findings.length === 0 ? (
+              <div style={{ color: '#8f9aaa', fontSize: '13px' }}>
+                No findings match this severity filter.
+              </div>
+            ) : (
+              <div style={{ display: 'grid', gap: '12px' }}>
+                {findings.map((finding, index) => (
+                  <article
+                    key={`${finding.file}-${finding.line}-${index}`}
+                    onClick={() => onOpenFile(finding.file)}
+                    style={{
+                      padding: '14px',
+                      border: '1px solid rgba(255,255,255,0.08)',
+                      borderRadius: '8px',
+                      background: 'rgba(255,255,255,0.02)',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', alignItems: 'center' }}>
+                      <strong>{finding.title}</strong>
+                      <span style={{ color: finding.severity === 'Critical' || finding.severity === 'High' ? '#ef7777' : '#aeb8c7', fontSize: '11px' }}>
+                        {finding.severity}
+                      </span>
+                    </div>
+                    <div style={{ color: '#8f9aaa', fontSize: '11px', marginTop: '6px' }}>
+                      {finding.file}{finding.line ? `:${finding.line}` : ''}
+                    </div>
+                    <p style={{ color: '#b7bfce', fontSize: '12px', lineHeight: 1.55, margin: '10px 0 6px' }}>
+                      {finding.explanation}
+                    </p>
+                    <div style={{ color: '#8f9aaa', fontSize: '11px', marginBottom: '6px' }}>
+                      Confidence: {Math.round(finding.confidence * 100)}%
+                    </div>
+                    <div style={{ color: '#8f9aaa', fontSize: '12px', lineHeight: 1.5 }}>
+                      Recommendation: {finding.suggestedFix}
+                    </div>
+                    <button type="button" className="primary" onClick={(event) => { event.stopPropagation(); onProposeFix(finding); }} style={{ marginTop: '14px' }}>
+                      <Sparkles size={14} />
+                      Propose fix
+                    </button>
+                  </article>
+                ))}
+              </div>
+            )}
+          </div>
+        </section>
+      )}
+    </section>
+  );
+}
+
+function isSecurityFinding(finding: RepositoryAnalysisFinding) {
+  return /security|vulnerab|secret|token|password|credential|auth|permission|access|injection|xss|csrf|encrypt|expos|attack|malicious|unsafe/i.test(
+    `${finding.title} ${finding.explanation} ${finding.suggestedFix} ${finding.file}`
+  );
+}
+
+function TestsView({
+  repository,
+  generatedTests,
+  loading,
+  error,
+  onGenerate,
+  onOpenFile,
+}: {
+  repository: Repository;
+  generatedTests: {
+    model: string;
+    filesAnalyzed: number;
+    summary: string;
+    tests: GeneratedTestCase[];
+  } | null;
+  loading: boolean;
+  error: string | null;
+  onGenerate: () => void;
+  onOpenFile: (path: string) => void;
+}) {
+  const [expandedTest, setExpandedTest] = useState<number | null>(null);
+
+  return (
+    <section className="content">
+      <div className="hero">
+        <div>
+          <div className="eyebrow"><span className="pulse"></span>TESTS</div>
+          <h1>{repository.name} test coverage</h1>
+          <p>Find missing coverage and review tests generated from real source files.</p>
+        </div>
+        <button className="primary" onClick={onGenerate} disabled={loading}>
+          {loading ? <Loader2 size={17} className="spin" /> : <TestTube2 size={17} />}
+          {loading ? 'Generating tests...' : 'Generate tests'}
+        </button>
+      </div>
+
+      {error && <section className="panel" style={{ marginTop: '24px' }}><div style={{ padding: '20px', color: '#ef7777', fontSize: '13px' }}>{error}</div></section>}
+
+      {!generatedTests && !loading && !error && (
+        <section className="panel" style={{ marginTop: '24px' }}>
+          <div style={{ padding: '32px', textAlign: 'center', color: '#8f9aaa' }}>
+            Generate tests to inspect missing or insufficient coverage in {repository.fullName}.
+          </div>
+        </section>
+      )}
+
+      {generatedTests && (
+        <section className="panel" style={{ marginTop: '24px' }}>
+          <PanelTitle title="Generated tests" action={`${generatedTests.filesAnalyzed} files · ${generatedTests.model}`} />
+          <div style={{ padding: '20px' }}>
+            <p style={{ margin: '0 0 18px', color: '#b7bfce', lineHeight: 1.6 }}>{generatedTests.summary}</p>
+            {generatedTests.tests.length === 0 ? (
+              <div style={{ color: '#8f9aaa', fontSize: '13px' }}>No meaningful missing tests were identified.</div>
+            ) : (
+              <div style={{ display: 'grid', gap: '12px' }}>
+                {generatedTests.tests.map((test, index) => (
+                  <article key={`${test.testFile}-${index}`} style={{ padding: '14px', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px', background: 'rgba(255,255,255,0.02)' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px' }}>
+                      <strong>{test.title}</strong>
+                      <span style={{ color: '#8f9aaa', fontSize: '11px' }}>{test.framework}</span>
+                    </div>
+                    <div style={{ color: '#8f9aaa', fontSize: '11px', marginTop: '7px' }}>Source: {test.sourceFile}</div>
+                    <div style={{ color: '#8f9aaa', fontSize: '11px', marginTop: '4px' }}>Suggested test file: {test.testFile}</div>
+                    <p style={{ color: '#b7bfce', fontSize: '12px', lineHeight: 1.55, margin: '10px 0' }}>{test.rationale}</p>
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                      <button type="button" onClick={() => onOpenFile(test.sourceFile)}>Open source file</button>
+                      <button type="button" className="primary" onClick={() => setExpandedTest(expandedTest === index ? null : index)}>
+                        <FileCode2 size={14} /> {expandedTest === index ? 'Hide generated test' : 'Review generated test'}
+                      </button>
+                    </div>
+                    {expandedTest === index && (
+                      <pre style={{ margin: '14px 0 0', padding: '14px', maxHeight: '360px', overflow: 'auto', background: '#0a0d12', color: '#b7bfce', font: '11px/1.55 Consolas, monospace', whiteSpace: 'pre-wrap' }}><code>{test.testCode}</code></pre>
+                    )}
+                  </article>
+                ))}
+              </div>
+            )}
+          </div>
+        </section>
+      )}
+    </section>
+  );
+}
+
+function AssistantView({
+  repository,
+  onAsk,
+  answer,
+  sources,
+  onIndex,
+  indexedFiles,
+  loading,
+  error,
+}: {
+  repository: Repository;
+  onAsk: (question: string) => void;
+  answer: { model: string; text: string } | null;
+  sources: string[];
+  onIndex: () => void;
+  indexedFiles: number | null;
+  loading: boolean;
+  error: string | null;
+}) {
+  const [question, setQuestion] = useState('');
+  const [askedQuestion, setAskedQuestion] = useState('');
+
+  function ask(value = question) {
+    const trimmed = value.trim();
+    if (!trimmed || loading) return;
+    setAskedQuestion(trimmed);
+    onAsk(trimmed);
+  }
+
+  return (
+    <section className="content">
+      <div className="hero">
+        <div>
+          <div className="eyebrow"><span className="pulse"></span>AI ENGINEERING ASSISTANT</div>
+          <h1>Ask about {repository.name}</h1>
+          <p>Answers are grounded in the files retrieved from {repository.fullName}.</p>
+        </div>
+      </div>
+      <section className="panel" style={{ marginTop: '24px' }}>
+        <PanelTitle title="Repository assistant" action="Ollama · Qwen2.5-Coder 1.5B" />
+        <div className="ai-body" style={{ padding: '28px', alignItems: 'stretch' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', color: '#8f9aaa', fontSize: '11px' }}>
+            <span>{indexedFiles === null ? 'Repository index will be built on first question.' : `${indexedFiles} files indexed`}</span>
+            <button type="button" onClick={onIndex} disabled={loading}>Refresh index</button>
+          </div>
+          <div className="suggestions">
+            {['Explain the authentication flow', 'Where are the main API endpoints?', 'What dependencies does this repository use?', 'Which files are most important?'].map((suggestion) => (
+              <button key={suggestion} type="button" onClick={() => { setQuestion(suggestion); ask(suggestion); }}>
+                {suggestion}
+              </button>
+            ))}
+          </div>
+          {askedQuestion && <div style={{ color: '#8f9aaa', fontSize: '12px' }}>Question: {askedQuestion}</div>}
+          {error && <div style={{ color: '#ef7777', fontSize: '13px' }}>{error}</div>}
+          {answer && <>
+            <pre style={{ margin: 0, padding: '18px', background: '#0a0d12', color: '#b7bfce', whiteSpace: 'pre-wrap', font: '12px/1.65 Inter, sans-serif' }}>{answer.text}</pre>
+            <div style={{ color: '#8f9aaa', fontSize: '11px' }}>Retrieved sources: {sources.join(', ')}</div>
+          </>}
+          <form className="ask" onSubmit={(event) => { event.preventDefault(); ask(); }}>
+            <input value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="Ask about this repository..." disabled={loading} />
+            <button type="submit" disabled={loading || !question.trim()}>{loading ? <Loader2 size={17} className="spin" /> : <Sparkles size={17} />}</button>
+          </form>
+        </div>
+      </section>
+    </section>
+  );
+}
+
+type PullRequestChange = {
+  path: string;
+  original: string;
+  approved: string;
+};
+
+type PullRequestDraft = {
+  title: string;
+  summary: string;
+  changes: PullRequestChange[];
+};
+
+function PullRequestsView({
+  repository,
+  draft,
+  analysis,
+  generatedTests,
+  loading,
+  error,
+  onPrepare,
+  onOpenFile,
+  onCreate,
+  createdPullRequest,
+  creating,
+}: {
+  repository: Repository;
+  draft: PullRequestDraft | null;
+  analysis: { findings: RepositoryAnalysisFinding[] } | null;
+  generatedTests: { tests: GeneratedTestCase[] } | null;
+  loading: boolean;
+  error: string | null;
+  onPrepare: () => void;
+  onOpenFile: (path: string) => void;
+  onCreate: () => void;
+  createdPullRequest: { url: string | null; number: number | null; branch: string } | null;
+  creating: boolean;
+}) {
+  return (
+    <section className="content">
+      <div className="hero">
+        <div>
+          <div className="eyebrow"><span className="pulse"></span>PULL REQUESTS</div>
+          <h1>{repository.name} change review</h1>
+          <p>Review approved CodePilot changes before creating a pull request.</p>
+        </div>
+        <button className="primary" onClick={onPrepare} disabled={loading}>
+          {loading ? <Loader2 size={17} className="spin" /> : <GitPullRequest size={17} />}
+          {loading ? 'Preparing review...' : 'Prepare PR review'}
+        </button>
+      </div>
+
+      {error && <section className="panel" style={{ marginTop: '24px' }}><div style={{ padding: '20px', color: '#ef7777', fontSize: '13px' }}>{error}</div></section>}
+
+      {!draft && !loading && !error && (
+        <section className="panel" style={{ marginTop: '24px' }}>
+          <div style={{ padding: '32px', textAlign: 'center', color: '#8f9aaa' }}>
+            Approve a CodePilot fix, then prepare a PR review from those GitHub-backed changes.
+          </div>
+        </section>
+      )}
+
+      {draft && (
+        <div style={{ display: 'grid', gap: '24px', marginTop: '24px' }}>
+          <section className="panel">
+            <PanelTitle title={draft.title} action="Review only" />
+            <div style={{ padding: '20px', display: 'grid', gap: '18px' }}>
+              <InfoRow label="Repository" value={repository.fullName} />
+              <div>
+                <div style={{ color: '#687284', fontSize: '11px', marginBottom: '7px' }}>Summary of changes</div>
+                <p style={{ margin: 0, color: '#b7bfce', fontSize: '13px', lineHeight: 1.6 }}>{draft.summary}</p>
+              </div>
+              <div>
+                <div style={{ color: '#687284', fontSize: '11px', marginBottom: '7px' }}>Why these changes were made</div>
+                <p style={{ margin: 0, color: '#b7bfce', fontSize: '13px', lineHeight: 1.6 }}>
+                  These files were explicitly approved through the existing CodePilot fix workflow and are ready for human review before a pull request is created.
+                </p>
+              </div>
+            </div>
+          </section>
+
+          <section className="panel">
+            <div style={{ padding: '20px', display: 'flex', justifyContent: 'flex-end', gap: '10px', alignItems: 'center' }}>
+              <span style={{ color: '#8f9aaa', fontSize: '12px' }}>Explicit approval is required before GitHub is changed.</span>
+              <button type="button" className="primary" onClick={onCreate} disabled={creating}>
+                {creating ? 'Creating pull request...' : 'Create Pull Request'}
+              </button>
+            </div>
+          </section>
+
+          <section className="panel">
+            <PanelTitle title="Affected files and diff" action={`${draft.changes.length} files`} />
+            <div style={{ padding: '20px', display: 'grid', gap: '16px' }}>
+              {draft.changes.map((change) => (
+                <div key={change.path}>
+                  <button type="button" onClick={() => onOpenFile(change.path)} style={{ border: 0, background: 'transparent', color: '#b7afff', cursor: 'pointer', padding: 0, fontSize: '12px' }}>
+                    {change.path}
+                  </button>
+                  <div className="diff-grid" style={{ marginTop: '8px' }}>
+                    <div className="diff-panel">
+                      <div className="diff-panel-label old">CURRENT GITHUB CODE</div>
+                      <pre className="diff-code"><code>{change.original}</code></pre>
+                    </div>
+                    <div className="diff-panel">
+                      <div className="diff-panel-label new">APPROVED CODE</div>
+                      <pre className="diff-code"><code>{change.approved}</code></pre>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+
+          <section className="panel">
+            <PanelTitle title="Analysis, security, and tests" />
+            <div style={{ padding: '20px', display: 'grid', gap: '16px' }}>
+              <div>
+                <strong style={{ fontSize: '12px' }}>Analysis findings</strong>
+                <p style={{ color: '#8f9aaa', fontSize: '12px' }}>
+                  {analysis?.findings.length ? `${analysis.findings.length} findings from the latest repository analysis.` : 'No repository analysis findings are loaded.'}
+                </p>
+                {analysis?.findings.map((finding) => <div key={`${finding.file}-${finding.line}-${finding.title}`} style={{ color: '#b7bfce', fontSize: '12px', marginTop: '6px' }}>{finding.severity}: {finding.title} ({finding.file}{finding.line ? `:${finding.line}` : ''})</div>)}
+              </div>
+              <div>
+                <strong style={{ fontSize: '12px' }}>Test results</strong>
+                <p style={{ color: '#8f9aaa', fontSize: '12px' }}>
+                  {generatedTests?.tests.length ? `${generatedTests.tests.length} generated test cases are available for review.` : 'No generated test results are loaded.'}
+                </p>
+              </div>
+              <div style={{ color: '#8f9aaa', fontSize: '12px' }}>
+                GitHub PR creation is not implemented yet. This review does not create or modify a pull request.
+              </div>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {createdPullRequest && (
+        <section className="panel" style={{ marginTop: '24px' }}>
+          <div style={{ padding: '20px', color: '#65e6a7', fontSize: '13px' }}>
+            Pull request created on branch <strong>{createdPullRequest.branch}</strong>.
+            {createdPullRequest.url && (
+              <> <a href={createdPullRequest.url} target="_blank" rel="noreferrer" style={{ color: '#b7afff' }}>Open pull request</a></>
+            )}
+          </div>
+        </section>
+      )}
+    </section>
+  );
+}
+
 function RepositoryWorkspace({
   repository,
+  showAnalysis,
+  showSecurity,
+  showTests,
+  showPullRequests,
+  showAssistant,
+  onOpenCodeExplorer,
   onBack,
 }: {
   repository: Repository;
+  showAnalysis: boolean;
+  showSecurity: boolean;
+  showTests: boolean;
+  showPullRequests: boolean;
+  showAssistant: boolean;
+  onOpenCodeExplorer: () => void;
   onBack: () => void;
 }) {
   const [tree, setTree] = useState<RepositoryTreeItem[]>([]);
@@ -1065,6 +1541,42 @@ function RepositoryWorkspace({
 
   const [analysisError, setAnalysisError] =
     useState<string | null>(null);
+
+  const [repositoryAnalysis, setRepositoryAnalysis] =
+    useState<{
+      model: string;
+      filesAnalyzed: number;
+      summary: string;
+      findings: RepositoryAnalysisFinding[];
+    } | null>(null);
+
+  const [repositoryAnalysisLoading, setRepositoryAnalysisLoading] =
+    useState(false);
+
+  const [repositoryAnalysisError, setRepositoryAnalysisError] =
+    useState<string | null>(null);
+
+  const [generatedTests, setGeneratedTests] = useState<{
+    model: string;
+    filesAnalyzed: number;
+    summary: string;
+    tests: GeneratedTestCase[];
+  } | null>(null);
+  const [testsLoading, setTestsLoading] = useState(false);
+  const [testsError, setTestsError] = useState<string | null>(null);
+  const [assistantAnswer, setAssistantAnswer] = useState<{ model: string; text: string } | null>(null);
+  const [assistantSources, setAssistantSources] = useState<string[]>([]);
+  const [indexedFiles, setIndexedFiles] = useState<number | null>(null);
+  const [assistantLoading, setAssistantLoading] = useState(false);
+  const [assistantError, setAssistantError] = useState<string | null>(null);
+  const [pullRequestDraft, setPullRequestDraft] = useState<PullRequestDraft | null>(null);
+  const [pullRequestLoading, setPullRequestLoading] = useState(false);
+  const [pullRequestError, setPullRequestError] = useState<string | null>(null);
+  const [createdPullRequest, setCreatedPullRequest] = useState<{
+    url: string | null;
+    number: number | null;
+    branch: string;
+  } | null>(null);
 
   const [fixProposal, setFixProposal] =
     useState<{ summary: string; originalCode: string; proposedCode: string; model: string } | null>(null);
@@ -1194,6 +1706,46 @@ function RepositoryWorkspace({
     }
   }
 
+  async function proposeFindingFix(
+    finding: RepositoryAnalysisFinding
+  ) {
+    try {
+      setSelectedFile(finding.file);
+      setFileLoading(true);
+      setFixLoading(true);
+      setFixError(null);
+      setAnalysis(null);
+      setAnalysisError(null);
+
+      const result = await getRepositoryFile(
+        repository.id,
+        finding.file
+      );
+      const approvedContent = approvedFiles[finding.file] ?? localStorage.getItem(
+        `codepilot-approved:${repository.id}:${finding.file}`
+      );
+      const content = approvedContent ?? result.content;
+
+      setFileContent(content);
+      setApprovedFiles((previous) => approvedContent
+        ? { ...previous, [finding.file]: approvedContent }
+        : previous);
+
+      const proposal = await proposeRepositoryFileFix(
+        repository.id,
+        finding.file,
+        content
+      );
+      setFixProposal(proposal);
+    } catch (err) {
+      console.error('Could not generate finding fix:', err);
+      setFixError(err instanceof Error ? err.message : 'Unable to generate file fix');
+    } finally {
+      setFileLoading(false);
+      setFixLoading(false);
+    }
+  }
+
   function rejectFix() {
     if (fixProposal) {
       setFileContent(fixProposal.originalCode);
@@ -1214,12 +1766,6 @@ function RepositoryWorkspace({
       setFixLoading(true);
       setFixError(null);
 
-      await updateRepositoryFile(
-        repository.id,
-        selectedFile,
-        fixProposal.proposedCode
-      );
-
       const approvedContent = fixProposal.proposedCode;
       setFileContent(approvedContent);
       setApprovedFiles((previous) => ({
@@ -1229,6 +1775,10 @@ function RepositoryWorkspace({
       localStorage.setItem(
         `codepilot-approved:${repository.id}:${selectedFile}`,
         approvedContent
+      );
+      localStorage.setItem(
+        `codepilot-approved-original:${repository.id}:${selectedFile}`,
+        fixProposal.originalCode
       );
 
       setFixProposal(null);
@@ -1289,6 +1839,143 @@ function RepositoryWorkspace({
       );
     } finally {
       setAnalysisLoading(false);
+    }
+  }
+
+  async function analyzeRepositoryWorkspace() {
+    try {
+      setRepositoryAnalysisLoading(true);
+      setRepositoryAnalysisError(null);
+
+      const result = await analyzeRepository(repository.id);
+      setRepositoryAnalysis(result);
+    } catch (err) {
+      console.error('Could not analyze repository:', err);
+      setRepositoryAnalysisError(
+        err instanceof Error
+          ? err.message
+          : 'Unable to analyze repository'
+      );
+    } finally {
+      setRepositoryAnalysisLoading(false);
+    }
+  }
+
+  async function generateTests() {
+    try {
+      setTestsLoading(true);
+      setTestsError(null);
+      const result = await generateRepositoryTests(repository.id);
+      setGeneratedTests(result);
+    } catch (err) {
+      console.error('Could not generate repository tests:', err);
+      setTestsError(err instanceof Error ? err.message : 'Unable to generate repository tests');
+    } finally {
+      setTestsLoading(false);
+    }
+  }
+
+  async function askAssistant(question: string) {
+    try {
+      setAssistantLoading(true);
+      setAssistantError(null);
+      const result = await askRepositoryAssistant(repository.id, question);
+      setAssistantAnswer({ model: result.model, text: result.answer });
+      setAssistantSources(result.sources);
+    } catch (err) {
+      console.error('Could not answer repository question:', err);
+      setAssistantError(err instanceof Error ? err.message : 'Unable to answer repository question');
+    } finally {
+      setAssistantLoading(false);
+    }
+  }
+
+  async function refreshRepositoryIndex() {
+    try {
+      setAssistantLoading(true);
+      setAssistantError(null);
+      const result = await indexRepository(repository.id);
+      setIndexedFiles(result.filesIndexed);
+      setAssistantSources([]);
+    } catch (err) {
+      setAssistantError(err instanceof Error ? err.message : 'Unable to index repository');
+    } finally {
+      setAssistantLoading(false);
+    }
+  }
+
+  async function preparePullRequest() {
+    try {
+      setPullRequestLoading(true);
+      setPullRequestError(null);
+      setCreatedPullRequest(null);
+
+      const prefix = `codepilot-approved:${repository.id}:`;
+      const approvedPaths = Object.keys(localStorage)
+        .filter((key) => key.startsWith(prefix))
+        .map((key) => key.slice(prefix.length));
+      const changes: PullRequestChange[] = [];
+
+      for (const path of approvedPaths) {
+        const approved = localStorage.getItem(`${prefix}${path}`);
+        if (approved === null) continue;
+        const original = localStorage.getItem(`codepilot-approved-original:${repository.id}:${path}`);
+        if (original !== null && original !== approved) {
+          changes.push({ path, original, approved });
+        }
+      }
+
+      if (changes.length === 0) {
+        setPullRequestDraft(null);
+        setPullRequestError('No approved code changes are available for this repository yet.');
+        return;
+      }
+
+      setPullRequestDraft({
+        title: `Apply CodePilot fixes to ${repository.name}`,
+        summary: `${changes.length} approved file${changes.length === 1 ? '' : 's'} differ from the current GitHub branch.`,
+        changes,
+      });
+    } catch (err) {
+      setPullRequestError(err instanceof Error ? err.message : 'Unable to prepare pull request review');
+    } finally {
+      setPullRequestLoading(false);
+    }
+  }
+
+  async function createPullRequest() {
+    if (!pullRequestDraft) return;
+
+    try {
+      setPullRequestLoading(true);
+      setPullRequestError(null);
+      const result = await createRepositoryPullRequest(
+        repository.id,
+        pullRequestDraft.title,
+        [
+          pullRequestDraft.summary,
+          '',
+          'Approved files:',
+          ...pullRequestDraft.changes.map((change) => `- ${change.path}`),
+          '',
+          'Analysis/security findings:',
+          ...(repositoryAnalysis?.findings || []).map((finding) => `- ${finding.severity}: ${finding.title} (${finding.file}${finding.line ? `:${finding.line}` : ''})`),
+          '',
+          'Test results:',
+          generatedTests?.tests.length
+            ? `- ${generatedTests.tests.length} generated test cases available for review`
+            : '- No generated test results loaded',
+        ].join('\n'),
+        pullRequestDraft.changes.map((change) => ({
+          path: change.path,
+          content: change.approved,
+        }))
+      );
+      setCreatedPullRequest(result);
+    } catch (err) {
+      setPullRequestError(err instanceof Error ? err.message : 'Unable to create pull request');
+    } finally {
+      setPullRequestLoading(false);
     }
   }
 
@@ -1395,6 +2082,67 @@ function RepositoryWorkspace({
   const sortedTree: RepositoryTreeItem[] = [];
   flattenTree('', sortedTree);
 
+  if (showAnalysis || showSecurity) {
+    return (
+      <CodeAnalysisView
+        repository={repository}
+        analysis={repositoryAnalysis}
+        loading={repositoryAnalysisLoading}
+        error={repositoryAnalysisError}
+        securityOnly={showSecurity}
+        onAnalyze={analyzeRepositoryWorkspace}
+        onOpenFile={(path) => { onOpenCodeExplorer(); void openFile(path); }}
+        onProposeFix={(finding) => { onOpenCodeExplorer(); void proposeFindingFix(finding); }}
+      />
+    );
+  }
+
+  if (showTests) {
+    return (
+      <TestsView
+        repository={repository}
+        generatedTests={generatedTests}
+        loading={testsLoading}
+        error={testsError}
+        onGenerate={generateTests}
+        onOpenFile={openFile}
+      />
+    );
+  }
+
+  if (showPullRequests) {
+    return (
+      <PullRequestsView
+        repository={repository}
+        draft={pullRequestDraft}
+        analysis={repositoryAnalysis}
+        generatedTests={generatedTests}
+        loading={pullRequestLoading}
+        error={pullRequestError}
+        onPrepare={preparePullRequest}
+        onOpenFile={(path) => { onOpenCodeExplorer(); void openFile(path); }}
+        onCreate={createPullRequest}
+        createdPullRequest={createdPullRequest}
+        creating={pullRequestLoading}
+      />
+    );
+  }
+
+  if (showAssistant) {
+    return (
+      <AssistantView
+        repository={repository}
+        onAsk={askAssistant}
+        answer={assistantAnswer}
+        sources={assistantSources}
+        onIndex={refreshRepositoryIndex}
+        indexedFiles={indexedFiles}
+        loading={assistantLoading}
+        error={assistantError}
+      />
+    );
+  }
+
   return (
     <section className="content">
       <button
@@ -1429,10 +2177,20 @@ function RepositoryWorkspace({
           </p>
         </div>
 
-        <button className="primary">
-          <Sparkles size={17} />
+        <button
+          className="primary"
+          onClick={analyzeRepositoryWorkspace}
+          disabled={repositoryAnalysisLoading}
+        >
+          {repositoryAnalysisLoading ? (
+            <Loader2 size={17} className="spin" />
+          ) : (
+            <Sparkles size={17} />
+          )}
 
-          Analyze repository
+          {repositoryAnalysisLoading
+            ? 'Analyzing repository...'
+            : 'Analyze repository'}
         </button>
       </div>
 
@@ -1468,6 +2226,79 @@ function RepositoryWorkspace({
           icon={<Bot />}
         />
       </div>
+
+      {(repositoryAnalysisError || repositoryAnalysis) && (
+        <section className="panel" style={{ marginTop: '24px' }}>
+          <PanelTitle
+            title="Repository analysis"
+            action={repositoryAnalysis
+              ? `${repositoryAnalysis.filesAnalyzed} files · ${repositoryAnalysis.model}`
+              : 'Error'}
+          />
+
+          <div style={{ padding: '20px' }}>
+            {repositoryAnalysisError ? (
+              <div style={{ color: '#ef4444', fontSize: '13px' }}>
+                {repositoryAnalysisError}
+              </div>
+            ) : repositoryAnalysis ? (
+              <>
+                <p style={{ margin: '0 0 18px', color: '#b7bfce', lineHeight: 1.6 }}>
+                  {repositoryAnalysis.summary}
+                </p>
+
+                {repositoryAnalysis.findings.length === 0 ? (
+                  <div style={{ color: '#8f9aaa', fontSize: '13px' }}>
+                    No actionable findings were returned for the analyzed files.
+                  </div>
+                ) : (
+                  <div style={{ display: 'grid', gap: '12px' }}>
+                    {repositoryAnalysis.findings.map((finding, index) => (
+                      <article
+                        key={`${finding.file}-${finding.line}-${index}`}
+                        style={{
+                          padding: '14px',
+                          border: '1px solid rgba(255,255,255,0.08)',
+                          borderRadius: '8px',
+                          background: 'rgba(255,255,255,0.02)',
+                        }}
+                      >
+                        <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', alignItems: 'center' }}>
+                          <strong>{finding.title}</strong>
+                          <span style={{ color: finding.severity === 'Critical' || finding.severity === 'High' ? '#ef7777' : '#aeb8c7', fontSize: '11px' }}>
+                            {finding.severity}
+                          </span>
+                        </div>
+                        <div style={{ color: '#8f9aaa', fontSize: '11px', marginTop: '6px' }}>
+                          {finding.file}:{finding.line}
+                        </div>
+                        <div style={{ color: '#8f9aaa', fontSize: '11px', marginTop: '6px' }}>
+                          Confidence: {Math.round(finding.confidence * 100)}%
+                        </div>
+                        <p style={{ color: '#b7bfce', fontSize: '12px', lineHeight: 1.55, margin: '10px 0 6px' }}>
+                          {finding.explanation}
+                        </p>
+                        <div style={{ color: '#8f9aaa', fontSize: '12px', lineHeight: 1.5 }}>
+                          Suggested fix: {finding.suggestedFix}
+                        </div>
+                        <div style={{ display: 'flex', gap: '8px', marginTop: '14px' }}>
+                          <button type="button" onClick={() => openFile(finding.file)}>
+                            View code
+                          </button>
+                          <button type="button" className="primary" onClick={() => proposeFindingFix(finding)}>
+                            <Sparkles size={14} />
+                            Propose fix
+                          </button>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                )}
+              </>
+            ) : null}
+          </div>
+        </section>
+      )}
 
       <div className="grid">
         <section className="panel">
