@@ -5,6 +5,10 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { PrismaClient } from './generated/prisma/client';
 import { PrismaPg } from '@prisma/adapter-pg';
 import {
@@ -72,7 +76,6 @@ app.use(
     origin: CLIENT_URL,
   })
 );
-
 app.use(express.json());
 
 // --------------------------------------------------
@@ -109,9 +112,19 @@ const analyzeRepositorySchema = z.object({
   repositoryId: z.string().min(1),
 });
 
+const generateTestsSchema = z.object({
+  repositoryId: z.string().min(1),
+  path: z.string().min(1).max(500).optional(),
+  functionName: z.string().min(1).max(200).optional(),
+});
+
 const assistantQuestionSchema = z.object({
   repositoryId: z.string().min(1),
   question: z.string().min(1).max(4_000),
+});
+
+const verifyRepositorySchema = z.object({
+  files: z.array(z.string()).optional().default([]),
 });
 
 function parseGeneratedTests(response: string) {
@@ -609,6 +622,22 @@ app.post('/api/auth/login', async (req, res) => {
       });
     }
 
+    await prisma.$transaction([
+      prisma.repository.deleteMany({
+        where: {
+          ownerId: user.id,
+        },
+      }),
+      prisma.user.update({
+        where: {
+          id: user.id,
+        },
+        data: {
+          githubAccessToken: null,
+        },
+      }),
+    ]);
+
     const token = signToken(user.id);
 
     return res.json({
@@ -681,14 +710,33 @@ app.get('/api/github/login', auth, async (req, res) => {
 
     const userId = (req as any).userId;
 
+    // Ensure the old GitHub account identity and repository rows
+    // are not carried into a new GitHub OAuth attempt.
+    await prisma.$transaction([
+      prisma.repository.deleteMany({
+        where: {
+          ownerId: userId,
+        },
+      }),
+      prisma.user.update({
+        where: {
+          id: userId,
+        },
+        data: {
+          githubAccessToken: null,
+        },
+      }),
+    ]);
+
     const state = signGithubState(userId);
 
     const params = new URLSearchParams({
-      client_id: clientId,
-      redirect_uri: GITHUB_CALLBACK_URL,
-      scope: 'repo read:user user:email',
-      state,
-    });
+  client_id: clientId,
+  redirect_uri: GITHUB_CALLBACK_URL,
+  scope: 'repo read:user user:email',
+  state,
+  prompt: 'select_account',
+});
 
     const githubUrl =
       `https://github.com/login/oauth/authorize?${params.toString()}`;
@@ -708,6 +756,48 @@ app.get('/api/github/login', auth, async (req, res) => {
 // --------------------------------------------------
 // GitHub OAuth - Callback
 // --------------------------------------------------
+
+app.post(
+  '/api/github/disconnect',
+  auth,
+  async (req, res) => {
+    try {
+      const userId =
+        (req as any).userId;
+
+      await prisma.$transaction([
+        prisma.repository.deleteMany({
+          where: {
+            ownerId: userId,
+          },
+        }),
+        prisma.user.update({
+          where: {
+            id: userId,
+          },
+          data: {
+            githubAccessToken: null,
+          },
+        }),
+      ]);
+
+      return res.json({
+        message:
+          'GitHub disconnected successfully',
+      });
+    } catch (error) {
+      console.error(
+        'GitHub disconnect error:',
+        error
+      );
+
+      return res.status(500).json({
+        message:
+          'Unable to disconnect GitHub',
+      });
+    }
+  }
+);
 
 app.get(
   '/api/github/callback',
@@ -809,7 +899,7 @@ app.get(
         String(tokenData.access_token);
 
       // --------------------------------------------------
-      // Store GitHub token
+      // Store the new GitHub token for this CodePilot user.
       // --------------------------------------------------
 
       await prisma.user.update({
@@ -822,14 +912,15 @@ app.get(
       });
 
       // --------------------------------------------------
-      // GitHub API headers
+      // GitHub API headers for the fresh token
       // --------------------------------------------------
 
       const headers =
         githubHeaders(githubToken);
 
       // --------------------------------------------------
-      // Get GitHub user
+      // Verify the authenticated GitHub account from the
+      // newly issued OAuth access token before importing.
       // --------------------------------------------------
 
       const githubUserResponse =
@@ -853,12 +944,38 @@ app.get(
       const githubUser =
         await githubUserResponse.json();
 
+      if (
+        !githubUser.login ||
+        typeof githubUser.id !== 'number'
+      ) {
+        console.error(
+          'GitHub account identity verification failed'
+        );
+
+        return res.redirect(
+          githubErrorRedirect('github_identity_verification_failed')
+        );
+      }
+
       console.log(
         `GitHub connected: ${githubUser.login}`
       );
 
       // --------------------------------------------------
-      // Get GitHub repositories
+      // Remove repository records tied to the same local
+      // CodePilot user so the previous GitHub account's
+      // repository identity is not carried forward.
+      // --------------------------------------------------
+
+      await prisma.repository.deleteMany({
+        where: {
+          ownerId: userId,
+        },
+      });
+
+      // --------------------------------------------------
+      // Get GitHub repositories from the newly authenticated
+      // GitHub account only.
       // --------------------------------------------------
 
       const repositoriesResponse =
@@ -989,11 +1106,29 @@ app.get(
   auth,
   async (req, res) => {
     try {
+      const userId =
+        (req as any).userId;
+
+      const user =
+        await prisma.user.findUnique({
+          where: {
+            id: userId,
+          },
+          select: {
+            githubAccessToken: true,
+          },
+        });
+
+      if (!user?.githubAccessToken) {
+        return res.json({
+          repositories: [],
+        });
+      }
+
       const repositories =
         await prisma.repository.findMany({
           where: {
-            ownerId:
-              (req as any).userId,
+            ownerId: userId,
           },
 
           orderBy: {
@@ -1625,11 +1760,12 @@ app.post(
         const encodedPath = change.path.split('/').map((segment) => encodeURIComponent(segment)).join('/');
         const fileUrl = `${apiBase}/contents/${encodedPath}`;
         const currentResponse = await fetch(`${fileUrl}?ref=${encodeURIComponent(repository.defaultBranch)}`, { headers });
-        if (!currentResponse.ok) {
+        if (!currentResponse.ok && currentResponse.status !== 404) {
           return res.status(502).json({ message: `Unable to read ${change.path} from the default branch` });
         }
-        const currentFile = await currentResponse.json() as { sha?: string };
-        if (!currentFile.sha) return res.status(502).json({ message: `GitHub did not return a revision for ${change.path}` });
+        const currentFile = currentResponse.ok
+          ? await currentResponse.json() as { sha?: string }
+          : {};
 
         const updateResponse = await fetch(fileUrl, {
           method: 'PUT',
@@ -1637,7 +1773,7 @@ app.post(
           body: JSON.stringify({
             message: `Apply approved CodePilot change to ${change.path}`,
             content: Buffer.from(change.content, 'utf-8').toString('base64'),
-            sha: currentFile.sha,
+            ...(currentFile.sha ? { sha: currentFile.sha } : {}),
             branch,
           }),
         });
@@ -1813,7 +1949,7 @@ app.post(
   auth,
   async (req, res) => {
     try {
-      const parsed = analyzeRepositorySchema.safeParse(req.body);
+      const parsed = generateTestsSchema.safeParse(req.body);
       if (!parsed.success) return res.status(400).json({ message: 'A valid repository is required' });
 
       const repository = await prisma.repository.findFirst({
@@ -1827,43 +1963,50 @@ app.post(
       });
       if (!user?.githubAccessToken) return res.status(400).json({ message: 'GitHub is not connected. Please connect GitHub first.' });
 
-      const parts = repository.fullName.split('/');
-      if (parts.length !== 2) return res.status(400).json({ message: 'Invalid GitHub repository name' });
-      const [owner, repo] = parts;
-      const headers = githubHeaders(user.githubAccessToken);
-      const treeResponse = await fetch(
-        `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees/${encodeURIComponent(repository.defaultBranch)}?recursive=1`,
-        { headers }
-      );
-      if (!treeResponse.ok) return res.status(502).json({ message: 'Unable to retrieve the repository source files from GitHub' });
+      const index = await buildRepositoryIndex(repository, user.githubAccessToken);
+      const query = [parsed.data.path, parsed.data.functionName, 'unit tests edge cases errors'].filter(Boolean).join(' ');
+      const retrieved = parsed.data.path
+        ? [] as IndexedRepositoryFile[]
+        : retrieveRepositoryContext(index, query);
+      if (parsed.data.path) {
+        const selectedFile = index.files.find((file) => file.path === parsed.data.path);
+        if (selectedFile) {
+          retrieved.unshift(selectedFile);
+        }
 
-      const treeData = await treeResponse.json() as { tree?: Array<{ type?: string; path?: string; sha?: string; size?: number }> };
-      const candidates = (treeData.tree || [])
-        .filter((item) => item.type === 'blob' && typeof item.path === 'string' && item.sha)
-        .filter((item) => isAnalyzablePath(item.path!, item.size))
-        .filter((item) => !/(^|\/)(test|tests|__tests__)(\/|$)|\.(test|spec)\.[^.]+$/i.test(item.path!))
-        .slice(0, 25);
-      const files: string[] = [];
-      let contextBytes = 0;
-
-      for (const candidate of candidates) {
-        const blobResponse = await fetch(
-          `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/blobs/${encodeURIComponent(candidate.sha!)}`,
-          { headers }
-        );
-        if (!blobResponse.ok) continue;
-        const blobData = await blobResponse.json() as { encoding?: string; content?: string };
-        if (blobData.encoding !== 'base64' || typeof blobData.content !== 'string') continue;
-        const content = Buffer.from(blobData.content.replace(/\s/g, ''), 'base64').toString('utf-8');
-        const section = `### FILE: ${candidate.path}\n${content}\n\n`;
-        const bytes = Buffer.byteLength(section, 'utf-8');
-        if (contextBytes + bytes > 100_000) continue;
-        files.push(section);
-        contextBytes += bytes;
+        if (!retrieved.some((file) => file.path === parsed.data.path)) {
+          const parts = repository.fullName.split('/');
+          if (parts.length !== 2) return res.status(400).json({ message: 'Invalid GitHub repository name' });
+          const encodedPath = parsed.data.path.split('/').map((segment) => encodeURIComponent(segment)).join('/');
+          const fileResponse = await fetch(
+            `https://api.github.com/repos/${encodeURIComponent(parts[0])}/${encodeURIComponent(parts[1])}/contents/${encodedPath}?ref=${encodeURIComponent(repository.defaultBranch)}`,
+            { headers: githubHeaders(user.githubAccessToken) }
+          );
+          if (fileResponse.ok) {
+            const fileData = await fileResponse.json() as { encoding?: string; content?: string };
+            if (fileData.encoding === 'base64' && typeof fileData.content === 'string') {
+              const content = Buffer.from(fileData.content.replace(/\s/g, ''), 'base64').toString('utf-8');
+              retrieved.unshift({
+                path: parsed.data.path,
+                content,
+                tokens: new Set(tokenize(`${parsed.data.path} ${content}`)),
+                symbols: extractSymbols(content),
+              });
+            }
+          }
+        }
       }
+      const files = retrieved.map((file) => `### FILE: ${file.path}\n${file.content}\n\n`);
 
       if (files.length === 0) return res.status(422).json({ message: 'No supported source files were found to test' });
-      const result = await generateRepositoryTests({ repository: repository.fullName, content: files.join('') });
+      const result = await generateRepositoryTests({
+        repository: repository.fullName,
+        content: [
+          parsed.data.path ? `Target source file: ${parsed.data.path}` : 'Target source file: choose from the retrieved files',
+          parsed.data.functionName ? `Target function: ${parsed.data.functionName}` : '',
+          files.join(''),
+        ].join('\n'),
+      });
       const generated = parseGeneratedTests(result.text);
       return res.json({ repository: repository.fullName, model: result.model, filesAnalyzed: files.length, ...generated });
     } catch (error) {
@@ -1910,6 +2053,400 @@ app.post(
     }
   }
 );
+
+app.post('/api/github/repositories/:repositoryId/verify', auth, async (req, res) => {
+  try {
+    const repositoryId = String(req.params.repositoryId);
+    const parsed = verifyRepositorySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ message: 'A valid verification file list is required' });
+    }
+
+    const userId = (req as any).userId;
+    const repository = await prisma.repository.findFirst({
+      where: { id: repositoryId, ownerId: userId },
+    });
+
+    if (!repository) {
+      return res.status(404).json({ message: 'Repository not found' });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { githubAccessToken: true },
+    });
+
+    if (!user?.githubAccessToken) {
+      return res.status(400).json({ message: 'GitHub is not connected. Please connect GitHub first.' });
+    }
+
+    const parts = repository.fullName.split('/');
+    if (parts.length !== 2) {
+      return res.status(400).json({ message: 'Invalid GitHub repository name' });
+    }
+
+    const [owner, repo] = parts;
+    const cloneRoot = join(tmpdir(), `codepilot-verify-${Date.now()}`);
+    mkdirSync(cloneRoot, { recursive: true });
+
+    const repoFolder = join(cloneRoot, repo);
+    const cloneUrl = `https://x-access-token:${user.githubAccessToken}@github.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}.git`;
+    const clone = spawnSync('git', ['clone', '--depth', '1', '--branch', repository.defaultBranch, cloneUrl, repoFolder], {
+      cwd: cloneRoot,
+      encoding: 'utf8',
+    });
+
+    if (clone.status !== 0 || clone.error) {
+      const output = `${clone.stdout || ''}\n${clone.stderr || ''}`;
+      return res.status(502).json({
+        repository: repository.fullName,
+        framework: 'none',
+        status: 'unavailable',
+        testsExecuted: [],
+        passed: 0,
+        failed: 0,
+        errorOutput: output || 'Unable to clone the repository for verification.',
+        summary: 'Verification is unavailable because the repository could not be fetched from GitHub.',
+        filesInvolved: parsed.data.files,
+      });
+    }
+
+    const packagePath = join(repoFolder, 'package.json');
+    if (!existsSync(packagePath)) {
+      rmSync(repoFolder, { recursive: true, force: true });
+      rmSync(cloneRoot, { recursive: true, force: true });
+      return res.json({
+        repository: repository.fullName,
+        framework: 'none',
+        status: 'unavailable',
+        testsExecuted: [],
+        passed: 0,
+        failed: 0,
+        errorOutput: 'Verification unavailable: no package.json script or test configuration detected for this repository.',
+        summary: 'Verification is unavailable because no package.json script or test framework is present.',
+        filesInvolved: parsed.data.files,
+      });
+    }
+
+    const packageManifest = JSON.parse(readFileSync(packagePath, 'utf8')) as {
+      scripts?: Record<string, string>;
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+    };
+
+    const dependencies = {
+      ...(packageManifest.dependencies || {}),
+      ...(packageManifest.devDependencies || {}),
+    };
+
+    const frameworks = Object.keys(dependencies).filter((dep) => [
+      'jest',
+      'vitest',
+      'mocha',
+      'ava',
+      'playwright',
+      'cypress',
+      'chai',
+      'ts-jest',
+    ].includes(dep));
+
+    if (frameworks.length === 0) {
+      rmSync(repoFolder, { recursive: true, force: true });
+      rmSync(cloneRoot, { recursive: true, force: true });
+      return res.json({
+        repository: repository.fullName,
+        framework: 'none',
+        status: 'unavailable',
+        testsExecuted: [],
+        passed: 0,
+        failed: 0,
+        errorOutput: 'Verification unavailable: no supported test framework detected in the repository package configuration.',
+        summary: 'Verification is unavailable because no test framework is declared in the repository package.json.',
+        filesInvolved: parsed.data.files,
+      });
+    }
+
+    const scripts = packageManifest.scripts || {};
+    const relevantKeys = Object.keys(scripts)
+      .filter((name) => {
+        const lower = name.toLowerCase();
+        return (
+          name === 'test' ||
+          name.startsWith('test:') ||
+          lower.includes('test') ||
+          lower === 'verify' ||
+          lower.startsWith('verify:') ||
+          lower === 'check' ||
+          lower.startsWith('check:') ||
+          lower === 'lint' ||
+          lower.startsWith('lint:') ||
+          lower === 'build' ||
+          lower.startsWith('build:') ||
+          lower === 'ci' ||
+          lower.startsWith('ci:')
+        );
+      })
+      .sort();
+
+    if (relevantKeys.length === 0) {
+      rmSync(repoFolder, { recursive: true, force: true });
+      rmSync(cloneRoot, { recursive: true, force: true });
+      return res.json({
+        repository: repository.fullName,
+        framework: frameworks.join(', '),
+        status: 'unavailable',
+        testsExecuted: [],
+        passed: 0,
+        failed: 0,
+        errorOutput: 'Verification unavailable: no runnable test or verification scripts were declared in the repository package.json.',
+        summary: 'Verification is unavailable because the repository has a detected framework but no matching test or verification scripts.',
+        filesInvolved: parsed.data.files,
+      });
+    }
+
+    const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+    const outputs: string[] = [];
+    let passed = 0;
+    let failed = 0;
+
+    for (const script of relevantKeys) {
+      const run = spawnSync(npmCommand, ['run', script], {
+        cwd: repoFolder,
+        encoding: 'utf8',
+        env: process.env,
+      });
+
+      const text = `${run.stdout || ''}\n${run.stderr || ''}`;
+      outputs.push(`${script}: ${text}`);
+
+      if (run.status === 0) {
+        passed++;
+      } else {
+        failed++;
+      }
+    }
+
+    const status = failed === 0 ? 'passed' : 'failed';
+    const summary = failed === 0
+      ? `Verification passed for ${relevantKeys.length} existing repository script(s).`
+      : `Verification failed for ${failed} script(s) while ${passed} succeeded.`;
+
+    rmSync(repoFolder, { recursive: true, force: true });
+    rmSync(cloneRoot, { recursive: true, force: true });
+
+    return res.json({
+      repository: repository.fullName,
+      framework: frameworks.join(', '),
+      status,
+      testsExecuted: relevantKeys,
+      passed,
+      failed,
+      errorOutput: outputs.join('\n---\n') || 'No error output.',
+      summary,
+      filesInvolved: parsed.data.files,
+    });
+  } catch (error) {
+    console.error('Repository verification error:', error);
+    return res.status(500).json({ message: error instanceof Error ? error.message : 'Unable to verify repository' });
+  }
+});
+
+app.post('/api/github/repositories/:repositoryId/verify', auth, async (req, res) => {
+  try {
+    const repositoryId = String(req.params.repositoryId);
+    const parsed = verifyRepositorySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ message: 'A valid verification file list is required' });
+    }
+
+    const userId = (req as any).userId;
+    const repository = await prisma.repository.findFirst({
+      where: { id: repositoryId, ownerId: userId },
+    });
+
+    if (!repository) {
+      return res.status(404).json({ message: 'Repository not found' });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { githubAccessToken: true },
+    });
+
+    if (!user?.githubAccessToken) {
+      return res.status(400).json({ message: 'GitHub is not connected. Please connect GitHub first.' });
+    }
+
+    const parts = repository.fullName.split('/');
+    if (parts.length !== 2) {
+      return res.status(400).json({ message: 'Invalid GitHub repository name' });
+    }
+
+    const [owner, repo] = parts;
+    const cloneRoot = join(tmpdir(), `codepilot-verify-${Date.now()}`);
+    mkdirSync(cloneRoot, { recursive: true });
+
+    const repoFolder = join(cloneRoot, repo);
+    const cloneUrl = `https://x-access-token:${user.githubAccessToken}@github.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}.git`;
+    const clone = spawnSync('git', ['clone', '--depth', '1', '--branch', repository.defaultBranch, cloneUrl, repoFolder], {
+      cwd: cloneRoot,
+      encoding: 'utf8',
+    });
+
+    if (clone.status !== 0 || clone.error) {
+      const output = `${clone.stdout || ''}\n${clone.stderr || ''}`;
+      return res.status(502).json({
+        repository: repository.fullName,
+        framework: 'none',
+        status: 'unavailable',
+        testsExecuted: [],
+        passed: 0,
+        failed: 0,
+        errorOutput: output || 'Unable to clone the repository for verification.',
+        summary: 'Verification is unavailable because the repository could not be fetched from GitHub.',
+        filesInvolved: parsed.data.files,
+      });
+    }
+
+    const packagePath = join(repoFolder, 'package.json');
+    if (!existsSync(packagePath)) {
+      rmSync(repoFolder, { recursive: true, force: true });
+      rmSync(cloneRoot, { recursive: true, force: true });
+      return res.json({
+        repository: repository.fullName,
+        framework: 'none',
+        status: 'unavailable',
+        testsExecuted: [],
+        passed: 0,
+        failed: 0,
+        errorOutput: 'Verification unavailable: no package.json script or test configuration detected for this repository.',
+        summary: 'Verification is unavailable because no package.json script or test framework is present.',
+        filesInvolved: parsed.data.files,
+      });
+    }
+
+    const packageManifest = JSON.parse(readFileSync(packagePath, 'utf8')) as {
+      scripts?: Record<string, string>;
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+    };
+
+    const dependencies = {
+      ...(packageManifest.dependencies || {}),
+      ...(packageManifest.devDependencies || {}),
+    };
+
+    const frameworks = Object.keys(dependencies).filter((dep) => [
+      'jest',
+      'vitest',
+      'mocha',
+      'ava',
+      'playwright',
+      'cypress',
+      'chai',
+      'ts-jest',
+    ].includes(dep));
+
+    if (frameworks.length === 0) {
+      rmSync(repoFolder, { recursive: true, force: true });
+      rmSync(cloneRoot, { recursive: true, force: true });
+      return res.json({
+        repository: repository.fullName,
+        framework: 'none',
+        status: 'unavailable',
+        testsExecuted: [],
+        passed: 0,
+        failed: 0,
+        errorOutput: 'Verification unavailable: no supported test framework detected in the repository package configuration.',
+        summary: 'Verification is unavailable because no test framework is declared in the repository package.json.',
+        filesInvolved: parsed.data.files,
+      });
+    }
+
+    const scripts = packageManifest.scripts || {};
+    const relevantKeys = Object.keys(scripts)
+      .filter((name) => {
+        const lower = name.toLowerCase();
+        return (
+          name === 'test' ||
+          name.startsWith('test:') ||
+          lower.includes('test') ||
+          lower === 'verify' ||
+          lower.startsWith('verify:') ||
+          lower === 'check' ||
+          lower.startsWith('check:') ||
+          lower === 'lint' ||
+          lower.startsWith('lint:') ||
+          lower === 'build' ||
+          lower.startsWith('build:') ||
+          lower === 'ci' ||
+          lower.startsWith('ci:')
+        );
+      })
+      .sort();
+
+    if (relevantKeys.length === 0) {
+      rmSync(repoFolder, { recursive: true, force: true });
+      rmSync(cloneRoot, { recursive: true, force: true });
+      return res.json({
+        repository: repository.fullName,
+        framework: frameworks.join(', '),
+        status: 'unavailable',
+        testsExecuted: [],
+        passed: 0,
+        failed: 0,
+        errorOutput: 'Verification unavailable: no runnable test or verification scripts were declared in the repository package.json.',
+        summary: 'Verification is unavailable because the repository has a detected framework but no matching test or verification scripts.',
+        filesInvolved: parsed.data.files,
+      });
+    }
+
+    const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+    const outputs: string[] = [];
+    let passed = 0;
+    let failed = 0;
+
+    for (const script of relevantKeys) {
+      const run = spawnSync(npmCommand, ['run', script], {
+        cwd: repoFolder,
+        encoding: 'utf8',
+        env: process.env,
+      });
+
+      const text = `${run.stdout || ''}\n${run.stderr || ''}`;
+      outputs.push(`${script}: ${text}`);
+
+      if (run.status === 0) {
+        passed++;
+      } else {
+        failed++;
+      }
+    }
+
+    const status = failed === 0 ? 'passed' : 'failed';
+    const summary = failed === 0
+      ? `Verification passed for ${relevantKeys.length} existing repository script(s).`
+      : `Verification failed for ${failed} script(s) while ${passed} succeeded.`;
+
+    rmSync(repoFolder, { recursive: true, force: true });
+    rmSync(cloneRoot, { recursive: true, force: true });
+
+    return res.json({
+      repository: repository.fullName,
+      framework: frameworks.join(', '),
+      status,
+      testsExecuted: relevantKeys,
+      passed,
+      failed,
+      errorOutput: outputs.join('\n---\n') || 'No error output.',
+      summary,
+      filesInvolved: parsed.data.files,
+    });
+  } catch (error) {
+    console.error('Repository verification error:', error);
+    return res.status(500).json({ message: error instanceof Error ? error.message : 'Unable to verify repository' });
+  }
+});
 
 app.post('/api/github/repositories/:repositoryId/index', auth, async (req, res) => {
   try {

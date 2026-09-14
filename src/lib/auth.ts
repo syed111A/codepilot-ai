@@ -24,6 +24,19 @@ export function saveAuth(token: string, user: User) {
 }
 
 export function logout() {
+  const token = getToken();
+
+  if (token) {
+    fetch('http://localhost:4000/api/github/disconnect', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    }).catch(() => {
+      // Ignore disconnect errors while returning to the login screen.
+    });
+  }
+
   localStorage.removeItem(TOKEN_KEY);
   localStorage.removeItem(USER_KEY);
 }

@@ -37,12 +37,16 @@ const systemPrompt = [
 ].join(' ');
 
 function getProviderConfig() {
-  const provider = process.env.AI_PROVIDER || 'ollama';
-  const model = provider === 'ollama'
-    ? (process.env.OLLAMA_MODEL || 'qwen2.5-coder:1.5b')
-    : (process.env.AI_MODEL || 'gpt-4o-mini');
+  const provider = (process.env.AI_PROVIDER || 'ollama').toLowerCase();
+  if (provider === 'google') {
+    return { provider, model: process.env.GOOGLE_MODEL || process.env.AI_MODEL || 'gemini-3.6-flash' };
+  }
 
-  return { provider, model };
+  if (provider === 'openai') {
+    return { provider, model: process.env.AI_MODEL || 'gpt-4o-mini' };
+  }
+
+  return { provider: 'ollama', model: process.env.OLLAMA_MODEL || 'qwen2.5-coder:1.5b' };
 }
 
 function formatUserPrompt(input: ProviderInput) {
@@ -111,6 +115,8 @@ export async function generateRepositoryTests(
       'Return valid JSON only with exactly these fields: summary (string) and tests (array).',
       'Each test must contain sourceFile, testFile, framework, title, rationale, and testCode as strings.',
       'Generate practical tests only for behavior supported by the supplied source. Prefer the repository language and existing test conventions.',
+      'Include normal unit cases, meaningful edge cases, and error or exception cases when the source behavior supports them.',
+      'When a target source file or function is provided, generate tests for that target first and do not invent a function that is absent from the context.',
       'Use an empty tests array when no meaningful test can be generated.',
     ].join(' '),
     input.content,
@@ -196,6 +202,43 @@ async function runProviderRequest(
       model,
       text: completion.choices[0]?.message?.content || '',
     };
+  }
+
+  if (provider === 'google') {
+    const apiKey = process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY || process.env.AI_API_KEY;
+
+    if (!apiKey) {
+      throw new Error('Google Gemini is not configured. Add GOOGLE_API_KEY to server/.env.');
+    }
+
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [
+            { role: 'user', parts: [{ text: `${system}\n\n${user}` }] },
+          ],
+          generationConfig: {
+            temperature: 0.2,
+            ...(jsonFormat ? { responseMimeType: 'application/json' } : {}),
+          },
+        }),
+      }
+    );
+
+    const data = await response.json() as {
+      error?: { message?: string };
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>; 
+    };
+
+    if (!response.ok) {
+      throw new Error(data.error?.message || 'Google Gemini could not process the request');
+    }
+
+    const text = data.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join('\n') || '';
+    return { model, text };
   }
 
   throw new Error(`Unsupported AI provider: ${provider}`);

@@ -106,6 +106,12 @@ export async function getRepositories() {
   return request<{ repositories: Repository[] }>('/repositories');
 }
 
+export async function disconnectGitHub() {
+  return request<{ message: string }>('/github/disconnect', {
+    method: 'POST',
+  });
+}
+
 export async function createRepository(repository: {
   name: string;
   fullName: string;
@@ -240,7 +246,11 @@ export type GeneratedTestCase = {
   testCode: string;
 };
 
-export async function generateRepositoryTests(repositoryId: string) {
+export async function generateRepositoryTests(
+  repositoryId: string,
+  path?: string,
+  functionName?: string
+) {
   return request<{
     repository: string;
     model: string;
@@ -249,7 +259,7 @@ export async function generateRepositoryTests(repositoryId: string) {
     tests: GeneratedTestCase[];
   }>('/ai/generate-tests', {
     method: 'POST',
-    body: JSON.stringify({ repositoryId }),
+    body: JSON.stringify({ repositoryId, path, functionName }),
   });
 }
 
@@ -278,6 +288,27 @@ export async function searchRepository(repositoryId: string, query: string) {
     filesIndexed: number;
     results: Array<{ path: string; symbols: string[]; score: number }>;
   }>(`/github/repositories/${repositoryId}/search?q=${encodeURIComponent(query)}`);
+}
+
+export type VerificationStatus = 'passed' | 'failed' | 'unavailable' | 'error';
+
+export type VerificationResult = {
+  repository: string;
+  framework: string;
+  status: VerificationStatus;
+  testsExecuted: string[];
+  passed: number;
+  failed: number;
+  errorOutput: string;
+  summary: string;
+  filesInvolved: string[];
+};
+
+export async function verifyRepository(repositoryId: string, files: string[] = []) {
+  return request<VerificationResult>(`/github/repositories/${repositoryId}/verify`, {
+    method: 'POST',
+    body: JSON.stringify({ files }),
+  });
 }
 
 export async function proposeRepositoryFileFix(

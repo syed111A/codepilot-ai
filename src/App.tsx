@@ -38,10 +38,12 @@ import {
   searchRepository,
   analyzeRepositoryFile,
   proposeRepositoryFileFix,
+  verifyRepository,
   type Repository,
   type RepositoryAnalysisFinding,
   type GeneratedTestCase,
   type RepositoryTreeItem,
+  type VerificationResult,
 } from './lib/api';
 
 import Auth from './components/Auth';
@@ -77,6 +79,8 @@ export default function App() {
 
   const [loading, setLoading] = useState(true);
   const [githubConnecting, setGithubConnecting] =
+    useState(false);
+  const [accountMenuOpen, setAccountMenuOpen] =
     useState(false);
 
   useEffect(() => {
@@ -476,9 +480,93 @@ export default function App() {
               <Activity size={18} />
             </button>
 
-            <UserCircle2
-              size={22}
-            />
+            <div style={{ position: 'relative' }}>
+              <button
+                className="icon-btn"
+                onClick={() =>
+                  setAccountMenuOpen(
+                    !accountMenuOpen
+                  )
+                }
+                title="Account"
+                aria-label="Open account menu"
+              >
+                <UserCircle2 size={22} />
+              </button>
+
+              {accountMenuOpen && (
+                <div
+                  style={{
+                    position: 'absolute',
+                    right: 0,
+                    top: 'calc(100% + 8px)',
+                    width: '240px',
+                    background:
+                      '#111827',
+                    border:
+                      '1px solid rgba(255,255,255,0.12)',
+                    borderRadius: '12px',
+                    boxShadow:
+                      '0 14px 40px rgba(0,0,0,0.35)',
+                    padding: '14px',
+                    zIndex: 100,
+                    color: '#e5e7eb',
+                  }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '10px',
+                      paddingBottom: '12px',
+                      borderBottom:
+                        '1px solid rgba(255,255,255,0.08)',
+                    }}
+                  >
+                    <div className="avatar">
+                      {user.name
+                        .split(' ')
+                        .map((x) => x[0])
+                        .join('')
+                        .slice(0, 2)
+                        .toUpperCase()}
+                    </div>
+
+                    <div>
+                      <strong style={{ display: 'block' }}>
+                        {user.name}
+                      </strong>
+                      <small style={{ color: '#9ca3af' }}>
+                        {user.email}
+                      </small>
+                    </div>
+                  </div>
+
+                  <button
+                    className="logout-menu-button"
+                    onClick={() => {
+                      setAccountMenuOpen(false);
+                      handleLogout();
+                    }}
+                    style={{
+                      width: '100%',
+                      marginTop: '12px',
+                      background:
+                        'transparent',
+                      color: '#fff',
+                      border:
+                        '1px solid rgba(255,255,255,0.14)',
+                      borderRadius: '10px',
+                      padding: '10px 12px',
+                      cursor: 'pointer',
+                      textAlign: 'left',
+                    }}
+                  >
+                    Logout
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
         </header>
 
@@ -776,35 +864,65 @@ function Dashboard({
           value={String(
             repositories.length
           )}
-          note={`${repositories.length} connected`}
+          note={
+            repositories.length
+              ? `${repositories.length} connected`
+              : 'No GitHub repositories'
+          }
           icon={
             <Code2 />
           }
         />
 
         <Metric
-          title="Code health"
-          value="94%"
-          note="↑ 6% this week"
+          title="GitHub status"
+          value={
+            repositories.length
+              ? 'Synced'
+              : 'Not connected'
+          }
+          note={
+            repositories.length
+              ? 'Repository data ready'
+              : 'Connect a repo'
+          }
           icon={
-            <CheckCircle2 />
+            <GitBranch />
           }
         />
 
         <Metric
-          title="Security issues"
-          value="4"
-          note="1 critical"
-          icon={
-            <AlertTriangle />
+          title="Security scan"
+          value={
+            repositories.length
+              ? 'Ready'
+              : 'Not ready'
           }
-          danger
+          note={
+            repositories.length
+              ? 'Scan available'
+              : 'No repository selected'
+          }
+          icon={
+            <ShieldCheck />
+          }
+          danger={
+            repositories.length === 0
+          }
         />
 
         <Metric
-          title="Test coverage"
-          value="78%"
-          note="↑ 12% this month"
+          title="Tests"
+          value={
+            repositories.length
+              ? 'Ready'
+              : 'No repo'
+          }
+          note={
+            repositories.length
+              ? 'Generate available'
+              : 'Connect GitHub first'
+          }
           icon={
             <TestTube2 />
           }
@@ -988,27 +1106,34 @@ function Dashboard({
           />
 
           <div className="analysis">
-            <Analysis
-              title="Authentication flow analysis"
-              repo="lifeline-api"
-              time="12 min ago"
-              status="Completed"
-            />
+            {repositories.length === 0 ? (
+              <div
+                style={{
+                  padding: '24px',
+                  color: '#687284',
+                  fontSize: '10px',
+                  textAlign: 'center',
+                }}
+              >
+                No repository analyses yet. Connect a GitHub repository to start.
+              </div>
+            ) : (
+              <>
+                <Analysis
+                  title="Repository imported"
+                  repo={repositories[0].fullName}
+                  time="just now"
+                  status={`${repositories.length} repo${repositories.length === 1 ? '' : 's'}`}
+                />
 
-            <Analysis
-              title="Security vulnerability scan"
-              repo="portfolio-web"
-              time="Yesterday"
-              status="4 findings"
-              warn
-            />
-
-            <Analysis
-              title="Test generation"
-              repo="ai-agent-lab"
-              time="Yesterday"
-              status="32 tests"
-            />
+                <Analysis
+                  title="Repository ready for analysis"
+                  repo={repositories[0].fullName}
+                  time="ready"
+                  status="Queued"
+                />
+              </>
+            )}
           </div>
         </section>
 
@@ -1029,7 +1154,7 @@ function Dashboard({
 
             <ActivityRow
               text="Repositories loaded"
-              detail={`${repositories.length} repositories`}
+              detail={`${repositories.length} repository${repositories.length === 1 ? '' : 'ies'}`}
               time="now"
             />
 
@@ -1199,10 +1324,12 @@ function isSecurityFinding(finding: RepositoryAnalysisFinding) {
 function TestsView({
   repository,
   generatedTests,
+  sourceFiles,
   loading,
   error,
   onGenerate,
   onOpenFile,
+  onApproveTest,
 }: {
   repository: Repository;
   generatedTests: {
@@ -1211,12 +1338,16 @@ function TestsView({
     summary: string;
     tests: GeneratedTestCase[];
   } | null;
+  sourceFiles: RepositoryTreeItem[];
   loading: boolean;
   error: string | null;
-  onGenerate: () => void;
+  onGenerate: (path: string, functionName: string) => void;
   onOpenFile: (path: string) => void;
+  onApproveTest: (test: GeneratedTestCase) => void;
 }) {
   const [expandedTest, setExpandedTest] = useState<number | null>(null);
+  const [selectedPath, setSelectedPath] = useState('');
+  const [functionName, setFunctionName] = useState('');
 
   return (
     <section className="content">
@@ -1226,13 +1357,25 @@ function TestsView({
           <h1>{repository.name} test coverage</h1>
           <p>Find missing coverage and review tests generated from real source files.</p>
         </div>
-        <button className="primary" onClick={onGenerate} disabled={loading}>
+        <button className="primary" onClick={() => onGenerate(selectedPath, functionName)} disabled={loading || !selectedPath}>
           {loading ? <Loader2 size={17} className="spin" /> : <TestTube2 size={17} />}
           {loading ? 'Generating tests...' : 'Generate tests'}
         </button>
       </div>
 
       {error && <section className="panel" style={{ marginTop: '24px' }}><div style={{ padding: '20px', color: '#ef7777', fontSize: '13px' }}>{error}</div></section>}
+
+      <section className="panel" style={{ marginTop: '24px' }}>
+        <PanelTitle title="Test target" action="Repository source" />
+        <div style={{ padding: '20px', display: 'grid', gap: '12px' }}>
+          <select value={selectedPath} onChange={(event) => setSelectedPath(event.target.value)} style={{ padding: '10px', background: '#11161e', color: '#d8dce5', border: '1px solid #293141', borderRadius: '6px' }}>
+            <option value="">Select a source file</option>
+            {sourceFiles.filter((item) => item.type === 'file' && !/(^|\/)(test|tests|__tests__)(\/|$)|\.(test|spec)\.[^.]+$/i.test(item.path)).map((item) => <option key={item.path} value={item.path}>{item.path}</option>)}
+          </select>
+          <input value={functionName} onChange={(event) => setFunctionName(event.target.value)} placeholder="Optional function or method name" style={{ padding: '10px', background: '#11161e', color: '#d8dce5', border: '1px solid #293141', borderRadius: '6px' }} />
+          <span style={{ color: '#8f9aaa', fontSize: '11px' }}>Tests are generated only from the selected file and related retrieved repository context.</span>
+        </div>
+      </section>
 
       {!generatedTests && !loading && !error && (
         <section className="panel" style={{ marginTop: '24px' }}>
@@ -1265,6 +1408,7 @@ function TestsView({
                       <button type="button" className="primary" onClick={() => setExpandedTest(expandedTest === index ? null : index)}>
                         <FileCode2 size={14} /> {expandedTest === index ? 'Hide generated test' : 'Review generated test'}
                       </button>
+                      <button type="button" onClick={() => onApproveTest(test)}>Approve test</button>
                     </div>
                     {expandedTest === index && (
                       <pre style={{ margin: '14px 0 0', padding: '14px', maxHeight: '360px', overflow: 'auto', background: '#0a0d12', color: '#b7bfce', font: '11px/1.55 Consolas, monospace', whiteSpace: 'pre-wrap' }}><code>{test.testCode}</code></pre>
@@ -1587,6 +1731,15 @@ function RepositoryWorkspace({
   const [fixError, setFixError] =
     useState<string | null>(null);
 
+  const [verification, setVerification] =
+    useState<VerificationResult | null>(null);
+
+  const [verificationLoading, setVerificationLoading] =
+    useState(false);
+
+  const [verificationError, setVerificationError] =
+    useState<string | null>(null);
+
   const [error, setError] =
     useState<string | null>(null);
 
@@ -1842,6 +1995,31 @@ function RepositoryWorkspace({
     }
   }
 
+  async function runVerification(files: string[] = []) {
+    try {
+      setVerificationLoading(true);
+      setVerificationError(null);
+      const result = await verifyRepository(repository.id, files);
+      setVerification(result);
+    } catch (err) {
+      console.error('Could not verify repository:', err);
+      setVerificationError(err instanceof Error ? err.message : 'Unable to run verification');
+      setVerification({
+        repository: repository.fullName,
+        framework: 'none',
+        status: 'error',
+        testsExecuted: [],
+        passed: 0,
+        failed: 0,
+        errorOutput: err instanceof Error ? err.message : 'Unable to run verification',
+        summary: 'Verification could not be run for this repository.',
+        filesInvolved: files,
+      });
+    } finally {
+      setVerificationLoading(false);
+    }
+  }
+
   async function analyzeRepositoryWorkspace() {
     try {
       setRepositoryAnalysisLoading(true);
@@ -1861,11 +2039,11 @@ function RepositoryWorkspace({
     }
   }
 
-  async function generateTests() {
+  async function generateTests(path: string, functionName: string) {
     try {
       setTestsLoading(true);
       setTestsError(null);
-      const result = await generateRepositoryTests(repository.id);
+      const result = await generateRepositoryTests(repository.id, path || undefined, functionName || undefined);
       setGeneratedTests(result);
     } catch (err) {
       console.error('Could not generate repository tests:', err);
@@ -1873,6 +2051,25 @@ function RepositoryWorkspace({
     } finally {
       setTestsLoading(false);
     }
+  }
+
+  function approveGeneratedTest(test: GeneratedTestCase) {
+    const key = `codepilot-approved:${repository.id}:${test.testFile}`;
+    const originalKey = `codepilot-approved-original:${repository.id}:${test.testFile}`;
+
+    setApprovedFiles((previous) => ({
+      ...previous,
+      [test.testFile]: test.testCode,
+    }));
+
+    localStorage.setItem(key, test.testCode);
+    localStorage.setItem(originalKey, '');
+
+    if (test.sourceFile) {
+      setSelectedFile(test.sourceFile);
+    }
+
+    setTestsError(`Approved ${test.testFile}. Open Pull Requests to review and create a branch-backed PR.`);
   }
 
   async function askAssistant(question: string) {
@@ -2102,10 +2299,12 @@ function RepositoryWorkspace({
       <TestsView
         repository={repository}
         generatedTests={generatedTests}
+        sourceFiles={sortedTree}
         loading={testsLoading}
         error={testsError}
         onGenerate={generateTests}
-        onOpenFile={openFile}
+        onOpenFile={(path) => { onOpenCodeExplorer(); void openFile(path); }}
+        onApproveTest={approveGeneratedTest}
       />
     );
   }
@@ -2726,6 +2925,17 @@ function RepositoryWorkspace({
                     >
                       {fixLoading ? <Loader2 size={14} className="spin" /> : <Sparkles size={14} />}
                       {fixLoading ? 'Preparing fix...' : 'Propose fix'}
+                    </button>
+
+                    <button
+                      type="button"
+                      className="primary"
+                      onClick={() => runVerification([selectedFile])}
+                      disabled={fileLoading || analysisLoading || fixLoading || verificationLoading || !fileContent}
+                      style={{ padding: '8px 11px', fontSize: '11px', flexShrink: 0 }}
+                    >
+                      {verificationLoading ? <Loader2 size={14} className="spin" /> : <TestTube2 size={14} />}
+                      {verificationLoading ? 'Verifying...' : 'Verify'}
                     </button>
                   </div>
 
