@@ -1,6 +1,41 @@
 {
-  "name":"codepilot-ai","private":true,"version":"0.2.0","type":"module",
-  "scripts":{"dev":"concurrently \"vite\" \"npm run server\"","dev:client":"vite","server":"tsx server/src/index.ts","build":"tsc -b && vite build","preview":"vite preview","db:generate":"prisma generate --schema server/prisma/schema.prisma","db:migrate":"prisma migrate dev --schema server/prisma/schema.prisma"},
-  "dependencies":{"@prisma/client":"latest","@vitejs/plugin-react":"latest","bcryptjs":"latest","cors":"latest","express":"latest","jsonwebtoken":"latest","lucide-react":"latest","react":"latest","react-dom":"latest","zod":"latest","vite":"latest","typescript":"latest"},
-  "devDependencies":{"@types/bcryptjs":"latest","@types/cors":"latest","@types/express":"latest","@types/jsonwebtoken":"latest","@types/node":"latest","@types/react":"latest","@types/react-dom":"latest","concurrently":"latest","prisma":"latest","tsx":"latest"}
+  "name": "codepilot-ai",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently \"vite\" \"npm run server\"",
+    "dev:client": "vite",
+    "server": "tsx server/src/index.ts",
+    "build": "tsc -p server/tsconfig.json && vite build",
+    "preview": "vite preview",
+    "db:generate": "prisma generate --schema server/prisma/schema.prisma",
+    "db:migrate": "prisma migrate dev --schema server/prisma/schema.prisma"
+  },
+  "dependencies": {
+    "@prisma/client": "latest",
+    "@vitejs/plugin-react": "latest",
+    "bcryptjs": "latest",
+    "cors": "latest",
+    "express": "latest",
+    "jsonwebtoken": "latest",
+    "lucide-react": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "zod": "latest",
+    "vite": "latest",
+    "typescript": "latest"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "latest",
+    "@types/cors": "latest",
+    "@types/express": "latest",
+    "@types/jsonwebtoken": "latest",
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "concurrently": "latest",
+    "prisma": "latest",
+    "tsx": "latest"
+  }
 }
