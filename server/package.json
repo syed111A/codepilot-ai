@@ -11,8 +11,6 @@
     "db:migrate": "prisma migrate dev --schema prisma/schema.prisma"
   },
   "dependencies": {
-    "@prisma/adapter-pg": "latest",
-    "openai": "latest",
     "@prisma/adapter-pg": "^7.10.0",
     "@prisma/client": "^7.10.0",
     "bcryptjs": "latest",
@@ -20,7 +18,7 @@
     "dotenv": "^17.4.2",
     "express": "latest",
     "jsonwebtoken": "latest",
-    "openai": "^7.9.0",
+    "openai": "^7.15.0",
     "pg": "^8.23.0",
     "zod": "latest"
   },
