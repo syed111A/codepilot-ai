@@ -1,3 +1,5 @@
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:4000/api';
+
 const TOKEN_KEY = 'codepilot_token';
 const USER_KEY = 'codepilot_user';
 
@@ -15,7 +17,12 @@ export function getToken() {
 export function getStoredUser(): User | null {
   const value = localStorage.getItem(USER_KEY);
   if (!value) return null;
-  try { return JSON.parse(value) as User; } catch { return null; }
+
+  try {
+    return JSON.parse(value) as User;
+  } catch {
+    return null;
+  }
 }
 
 export function saveAuth(token: string, user: User) {
@@ -27,7 +34,7 @@ export function logout() {
   const token = getToken();
 
   if (token) {
-    fetch('http://localhost:4000/api/github/disconnect', {
+    fetch(`${API_URL}/github/disconnect`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
@@ -45,8 +52,10 @@ export async function getMe(): Promise<User | null> {
   const token = getToken();
   if (!token) return null;
 
-  const response = await fetch('http://localhost:4000/api/auth/me', {
-    headers: { Authorization: `Bearer ${token}` }
+  const response = await fetch(`${API_URL}/auth/me`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
   });
 
   if (!response.ok) {
@@ -55,12 +64,17 @@ export async function getMe(): Promise<User | null> {
   }
 
   const contentType = response.headers.get('content-type') || '';
+
   if (!contentType.includes('application/json')) {
     logout();
-    throw new Error(`Authentication API returned an unexpected response (HTTP ${response.status})`);
+    throw new Error(
+      `Authentication API returned an unexpected response (HTTP ${response.status})`
+    );
   }
 
   const data = await response.json();
+
   localStorage.setItem(USER_KEY, JSON.stringify(data.user));
+
   return data.user;
 }

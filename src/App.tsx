@@ -198,16 +198,20 @@ export default function App() {
     try {
       setGithubConnecting(true);
 
-      const response = await fetch(
-        'http://localhost:4000/api/github/login',
-        {
-          method: 'GET',
-          headers: {
-            Authorization:
-              `Bearer ${token}`,
-          },
-        }
-      );
+     const API_URL =
+  import.meta.env.VITE_API_URL ||
+  'http://localhost:4000/api';
+
+const response = await fetch(
+  `${API_URL}/github/login`,
+  {
+    method: 'GET',
+    headers: {
+      Authorization:
+        `Bearer ${token}`,
+    },
+  }
+);
 
       const data =
         await response.json();
