@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.2.0",
   "type": "module",
+  "workspaces": [
+    "server"
+  ],
   "scripts": {
     "dev": "concurrently \"vite\" \"npm run server\"",
     "dev:client": "vite",
