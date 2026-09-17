@@ -514,6 +514,14 @@ function parseRepositoryReview(
 // Health Check
 // --------------------------------------------------
 
+app.get('/', (_req, res) => {
+  return res.json({
+    service: 'CodePilot API',
+    status: 'ok',
+    health: '/api/health',
+  });
+});
+
 app.get('/api/health', (_req, res) => {
   return res.json({
     status: 'ok',
