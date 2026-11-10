@@ -87,3 +87,11 @@ Keep `server/.env` and all provider credentials private. Use HTTPS and a strong 
 ## License
 
 This project is licensed under the [MIT License](https://opensource.org/licenses/MIT).
+
+
+
+
+<img width="1920" height="1080" alt="Screenshot (8)" src="https://github.com/user-attachments/assets/54e12f77-9233-46cc-ace6-1cd5d95f4d45" />
+<img width="1920" height="1080" alt="Screenshot (9)" src="https://github.com/user-attachments/assets/18ae2cff-9139-4aa9-af0a-8dd1091cdd4f" />
+<img width="1920" height="1080" alt="Screenshot (10)" src="https://github.com/user-attachments/assets/832a2548-be88-4936-99e7-72e3b316c593" />
+
