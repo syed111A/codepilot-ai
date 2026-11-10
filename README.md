@@ -86,4 +86,4 @@ Keep `server/.env` and all provider credentials private. Use HTTPS and a strong 
 
 ## License
 
-No license has been declared yet.
+This project is licensed under the [MIT License](https://opensource.org/licenses/MIT).
